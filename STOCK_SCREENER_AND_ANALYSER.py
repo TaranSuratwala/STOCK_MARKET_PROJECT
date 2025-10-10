@@ -1,7 +1,7 @@
 # import os
 # import warnings
 # import numpy as np
-# import pandas as pd
+# import pandas as 
 # import yfinance as yf
 # import ta
 # import plotly.graph_objects as go
