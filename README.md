@@ -20,23 +20,8 @@
     
       
         Suggested change
-      
-    
-    
-      
-          
             
-            | **Watchlist** | Save and monitor your favourite stocks |
-          
-          
-            
-            | **Watchlist** | Save and monitor your favorite stocks |
-          
-      
-    
-    Unable to apply suggestions when viewing a specific commit range.
-  
-Copilot uses AI. Check for mistakes.Positive FeedbackNegative FeedbackReactWrite a replyResolve comment
+| **Watchlist** | Save and monitor your favorite stocks |
 | **Price Alerts** | Create price-trigger alerts and view alert history |
 | **Fundamental Analysis** | P/E, P/B, PEG, EV/EBITDA, ROE, ROCE, debt ratios, and more via yfinance |
 | **News Sentiment** | Live news fetched from NewsAPI and scored with TextBlob |
@@ -53,52 +38,12 @@ Copilot uses AI. Check for mistakes.Positive FeedbackNegative FeedbackReactWrite
 - **NLP / Sentiment**: TextBlob, NLTK
 - **Visualisation**: Plotly, Matplotlib, Seaborn
 - **Other**: SciPy, NetworkX, Optuna, Transformers (HuggingFace), Flask (export API)
-Collapse commentComment on lines R31 to R35Copilot commented on Feb 24, 2026 CopilotAIon Feb 24, 2026AuthorMore actionsThe tech stack lists several libraries (XGBoost, Flask, Optuna, Transformers, NetworkX) that are installed in requirements.txt but do not appear to be used in the codebase. Consider removing these from the tech stack list to accurately reflect the technologies actively used in the application, or clarify that these are available for future use.
+The tech stack lists several libraries (XGBoost, Flask, Optuna, Transformers, NetworkX) that are installed in requirements.txt but do not appear to be used in the codebase. Consider removing these from the tech stack list to accurately reflect the technologies actively used in the application, or clarify that these are available for future use.
   
     
-      
-        Suggested change
-      
-    
-    
-      
+  
           
-            
-            - **Machine Learning**: scikit-learn (Random Forest, Gradient Boosting), TensorFlow / Keras, XGBoost
-          
-          
-            
-            - **NLP / Sentiment**: TextBlob, NLTK
-          
-          
-            
-            - **Visualisation**: Plotly, Matplotlib, Seaborn
-          
-          
-            
-            - **Other**: SciPy, NetworkX, Optuna, Transformers (HuggingFace), Flask (export API)
-          
-          
-            
-            - **Machine Learning**: scikit-learn (Random Forest, Gradient Boosting), TensorFlow / Keras
-          
-          
-            
-            - **NLP / Sentiment**: TextBlob, NLTK
-          
-          
-            
-            - **Visualisation**: Plotly, Matplotlib, Seaborn
-          
-          
-            
-            - **Other**: SciPy
-          
-          
-            
-            - **Optional / Planned (available via requirements)**: XGBoost, NetworkX, Optuna, Transformers (HuggingFace), Flask (for potential API export)
-          
-      
+  
     
     Unable to apply suggestions when viewing a specific commit range.
   
@@ -179,24 +124,6 @@ Alternatively, you can set it directly in `app.py`, but **avoid committing secre
   
     
       
-        Suggested change
-      
-    
-    
-      
-          
-            
-            Alternatively, you can set it directly in `app.py`, but **avoid committing secrets to version control**.
-          
-          
-            
-            The `app.py` file currently contains a hardcoded `NEWS_API_KEY` placeholder used for demonstration. **You should remove or replace this value and rely on the `NEWS_API_KEY` environment variable shown above.** Do not commit real API keys or other secrets to version control.
-          
-      
-    
-    Unable to apply suggestions when viewing a specific commit range.
-  
-Copilot uses AI. Check for mistakes.Positive FeedbackNegative FeedbackReactWrite a replyResolve comment
 
 ---
 
