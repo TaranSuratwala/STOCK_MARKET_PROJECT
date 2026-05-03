@@ -75,6 +75,7 @@ def register_user(username: str, password: str, full_name: str = "", email: str 
         "watchlist": [],
         "portfolio": [],
         "alerts": [],
+        "trade_journal": [],
     }
     _save_users(data)
     return True, "Registration successful!"
@@ -130,6 +131,10 @@ def save_user_portfolio(username: str, portfolio: list):
 
 def save_user_alerts(username: str, alerts: list):
     return update_user_data(username, "alerts", alerts)
+
+
+def save_user_trade_journal(username: str, trade_journal: list):
+    return update_user_data(username, "trade_journal", trade_journal)
 
 
 def save_user_settings(username: str, settings: dict):

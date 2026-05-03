@@ -9,9 +9,11 @@ import numpy as np
 import requests
 from io import StringIO
 from datetime import datetime, timedelta
-from functools import lru_cache
-import warnings
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import warnings
 
 warnings.filterwarnings("ignore")
 
@@ -164,6 +166,161 @@ class MultiExchangeHandler:
         self.exchange_config = EXCHANGE_CONFIG
         self.stock_lists = STOCK_LISTS
         self._cache = {}
+        self._cache_lock = threading.Lock()
+        self.realtime_mode = True
+        self.cache_ttl_seconds = 300
+        self.realtime_cache_ttl_seconds = 8
+        self.max_parallel_workers = 8
+        self.max_bulk_chunk_size = 180
+        self._latency_ema = None
+        self._latency_ema_alpha = 0.25
+        self._last_bulk_meta = {}
+
+    def set_realtime_mode(self, enabled=True):
+        """Enable or disable realtime mode for market data retrieval."""
+        previous_mode = self.realtime_mode
+        self.realtime_mode = bool(enabled)
+        if self.realtime_mode and not previous_mode:
+            self.clear_cache()
+
+    def clear_cache(self):
+        """Clear in-memory OHLCV cache."""
+        with self._cache_lock:
+            self._cache.clear()
+
+    def _get_effective_cache_ttl(self):
+        """Use short TTL in realtime mode and longer TTL otherwise."""
+        return self.realtime_cache_ttl_seconds if self.realtime_mode else self.cache_ttl_seconds
+
+    def _update_latency_ema(self, sample_seconds):
+        """Track moving average of per-symbol fetch latency for adaptive tuning."""
+        try:
+            sample = float(sample_seconds)
+        except Exception:
+            return
+
+        if sample <= 0:
+            return
+
+        if self._latency_ema is None:
+            self._latency_ema = sample
+        else:
+            self._latency_ema = (
+                self._latency_ema_alpha * sample
+                + (1 - self._latency_ema_alpha) * self._latency_ema
+            )
+
+    def get_adaptive_worker_count(self, task_size, exchange=None, interval="1d", user_cap=None):
+        """Compute an adaptive worker count to reduce latency and avoid API throttling."""
+        try:
+            size = max(1, int(task_size))
+        except Exception:
+            size = 1
+
+        cpu_count = os.cpu_count() or 4
+        cpu_cap = max(4, min(24, cpu_count * 2))
+        exchange_cap = {
+            "NSE": 14,
+            "BSE": 12,
+            "NYSE": 18,
+            "NASDAQ": 18,
+            "LSE": 12,
+        }.get(exchange, cpu_cap)
+
+        cap = min(cpu_cap, exchange_cap)
+
+        if str(interval).lower().endswith("m"):
+            cap = min(cap, 8)
+
+        if size <= 20:
+            cap = min(cap, 6)
+        elif size <= 60:
+            cap = min(cap, 10)
+
+        if self._latency_ema is not None:
+            if self._latency_ema > 2.5:
+                cap = min(cap, 4)
+            elif self._latency_ema > 1.2:
+                cap = min(cap, 6)
+
+        if user_cap is not None:
+            try:
+                cap = min(cap, max(1, int(user_cap)))
+            except Exception:
+                pass
+
+        cap = min(cap, self.max_parallel_workers)
+        return max(1, min(cap, size))
+
+    def get_last_bulk_meta(self):
+        """Return metadata from the last bulk fetch operation."""
+        return dict(self._last_bulk_meta)
+
+    def _minimum_rows_required(self, period, interval):
+        """Allow short lookbacks for alerting while preserving longer analyses."""
+        short_periods = {"1d", "5d", "7d", "1wk", "1mo"}
+        if str(interval).lower().endswith("m"):
+            return 2
+        if str(period).lower() in short_periods:
+            return 2
+        return 30
+
+    def _inject_latest_quote(self, df, ticker):
+        """Patch latest quote into final row so users see fresher realtime values."""
+        if df is None or df.empty:
+            return df
+
+        live_price = None
+        live_volume = None
+
+        try:
+            fast_info = getattr(ticker, "fast_info", {}) or {}
+            live_price = fast_info.get("lastPrice") or fast_info.get("regularMarketPrice")
+            live_volume = fast_info.get("lastVolume") or fast_info.get("regularMarketVolume")
+        except Exception:
+            pass
+
+        if live_price is None:
+            try:
+                info = ticker.info or {}
+                live_price = info.get("regularMarketPrice") or info.get("currentPrice")
+                live_volume = live_volume or info.get("regularMarketVolume")
+            except Exception:
+                pass
+
+        if live_price is None:
+            return df
+
+        updated = df.copy()
+        last_idx = updated.index[-1]
+
+        try:
+            live_price = float(live_price)
+        except Exception:
+            return updated
+
+        if "Close" in updated.columns:
+            updated.at[last_idx, "Close"] = live_price
+
+        if "High" in updated.columns:
+            try:
+                updated.at[last_idx, "High"] = max(float(updated.at[last_idx, "High"]), live_price)
+            except Exception:
+                updated.at[last_idx, "High"] = live_price
+
+        if "Low" in updated.columns:
+            try:
+                updated.at[last_idx, "Low"] = min(float(updated.at[last_idx, "Low"]), live_price)
+            except Exception:
+                updated.at[last_idx, "Low"] = live_price
+
+        if "Volume" in updated.columns and live_volume is not None:
+            try:
+                updated.at[last_idx, "Volume"] = max(float(updated.at[last_idx, "Volume"]), float(live_volume))
+            except Exception:
+                pass
+
+        return updated
 
     def get_supported_exchanges(self):
         """Get list of supported exchanges"""
@@ -184,27 +341,110 @@ class MultiExchangeHandler:
             return symbol + suffix
         return symbol
 
-    def get_stock_data(self, symbol, exchange, period="2y", interval="1d"):
-        """Fetch stock data for any exchange"""
+    def get_stock_data(self, symbol, exchange, period="2y", interval="1d", use_cache=None, include_live_quote=True):
+        """Fetch stock data for any exchange with realtime-first defaults."""
+        if use_cache is None:
+            use_cache = True
+
         cache_key = f"{symbol}_{exchange}_{period}_{interval}"
-        if cache_key in self._cache:
-            cached_time, cached_data = self._cache[cache_key]
-            if (datetime.now() - cached_time).seconds < 3600:  # 1 hr cache
-                return cached_data
+        effective_ttl = self._get_effective_cache_ttl()
+        if use_cache:
+            with self._cache_lock:
+                if cache_key in self._cache:
+                    cached_time, cached_data = self._cache[cache_key]
+                    if (datetime.now() - cached_time).total_seconds() < effective_ttl:
+                        return cached_data.copy()
 
         try:
             full_symbol = self.get_symbol_with_suffix(symbol, exchange)
             ticker = yf.Ticker(full_symbol)
-            df = ticker.history(period=period, interval=interval)
+            df = ticker.history(period=period, interval=interval, auto_adjust=False, prepost=True)
 
-            if df.empty or len(df) < 30:
+            min_rows = self._minimum_rows_required(period, interval)
+            if df.empty or len(df) < min_rows:
                 return None
 
-            self._cache[cache_key] = (datetime.now(), df)
+            if include_live_quote:
+                df = self._inject_latest_quote(df, ticker)
+
+            if use_cache:
+                with self._cache_lock:
+                    self._cache[cache_key] = (datetime.now(), df.copy())
+
             return df
         except Exception as e:
             print(f"Error fetching {symbol} from {exchange}: {e}")
             return None
+
+    def get_bulk_stock_data(self, symbols, exchange, period="2y", interval="1d", max_workers=None, include_live_quote=True):
+        """Fetch multiple symbols concurrently while preserving realtime behavior."""
+        if not symbols:
+            return {}
+
+        unique_symbols = list(dict.fromkeys([str(s).strip().upper() for s in symbols if s]))
+        if not unique_symbols:
+            return {}
+
+        if max_workers is None:
+            max_workers = self.max_parallel_workers
+
+        results = {}
+        total_requested = len(unique_symbols)
+        workers_used = []
+        chunk_count = 0
+
+        chunk_size = max(1, min(self.max_bulk_chunk_size, total_requested))
+
+        def _worker(sym):
+            data = self.get_stock_data(
+                sym,
+                exchange,
+                period=period,
+                interval=interval,
+                use_cache=True,
+                include_live_quote=include_live_quote,
+            )
+            return sym, data
+
+        for start in range(0, total_requested, chunk_size):
+            chunk = unique_symbols[start:start + chunk_size]
+            adaptive_workers = self.get_adaptive_worker_count(
+                len(chunk),
+                exchange=exchange,
+                interval=interval,
+                user_cap=max_workers,
+            )
+            workers_used.append(adaptive_workers)
+            chunk_count += 1
+
+            chunk_start = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=adaptive_workers) as executor:
+                futures = [executor.submit(_worker, sym) for sym in chunk]
+                for future in as_completed(futures):
+                    try:
+                        sym, data = future.result()
+                        if data is not None:
+                            results[sym] = data
+                    except Exception:
+                        continue
+
+            chunk_elapsed = time.perf_counter() - chunk_start
+            per_symbol_latency = chunk_elapsed / max(1, len(chunk))
+            self._update_latency_ema(per_symbol_latency)
+
+        if workers_used:
+            self._last_bulk_meta = {
+                "requested": total_requested,
+                "fetched": len(results),
+                "chunks": chunk_count,
+                "workers_min": min(workers_used),
+                "workers_max": max(workers_used),
+                "latency_ema": self._latency_ema,
+                "realtime_mode": self.realtime_mode,
+                "cache_ttl_seconds": self._get_effective_cache_ttl(),
+            }
+
+        return results
 
     def get_stock_info(self, symbol, exchange):
         """Get stock info (fundamentals) for any exchange"""
@@ -301,27 +541,48 @@ class MarketOverview:
     def __init__(self, exchange_handler: MultiExchangeHandler):
         self.handler = exchange_handler
 
+    def _fetch_index_snapshot(self, exchange, config):
+        """Fetch a single exchange index snapshot."""
+        try:
+            ticker = yf.Ticker(config["index"])
+            hist = ticker.history(period="5d", auto_adjust=False, prepost=True)
+            if hist.empty or len(hist) < 2:
+                return exchange, None
+
+            current = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2])
+            change = current - prev
+            change_pct = (change / prev) * 100 if prev else 0.0
+
+            return exchange, {
+                "name": config["index_name"],
+                "value": current,
+                "change": change,
+                "change_pct": change_pct,
+                "currency": config["currency_symbol"],
+            }
+        except Exception:
+            return exchange, None
+
     def get_all_indices(self):
         """Get current data for all market indices"""
         indices = {}
-        for exchange, config in EXCHANGE_CONFIG.items():
-            try:
-                ticker = yf.Ticker(config["index"])
-                hist = ticker.history(period="5d")
-                if not hist.empty and len(hist) >= 2:
-                    current = hist["Close"].iloc[-1]
-                    prev = hist["Close"].iloc[-2]
-                    change = current - prev
-                    change_pct = (change / prev) * 100
-                    indices[exchange] = {
-                        "name": config["index_name"],
-                        "value": current,
-                        "change": change,
-                        "change_pct": change_pct,
-                        "currency": config["currency_symbol"],
-                    }
-            except:
-                pass
+
+        workers = min(max(1, len(EXCHANGE_CONFIG)), 6)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(self._fetch_index_snapshot, exchange, config)
+                for exchange, config in EXCHANGE_CONFIG.items()
+            ]
+
+            for future in as_completed(futures):
+                try:
+                    exchange, payload = future.result()
+                    if payload is not None:
+                        indices[exchange] = payload
+                except Exception:
+                    continue
+
         return indices
 
     def get_sector_performance(self, exchange="NSE"):

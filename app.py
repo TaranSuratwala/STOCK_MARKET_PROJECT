@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 import json
 import time
 import warnings
+import os
+import smtplib
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier, GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
@@ -23,10 +25,11 @@ from sklearn.metrics import accuracy_score, mean_absolute_error, r2_score
 import requests
 from io import StringIO
 import concurrent.futures
-from functools import lru_cache
 from textblob import TextBlob
 import re
 from scipy import stats
+from pathlib import Path
+from email.message import EmailMessage
 
 # New advanced modules
 from multi_exchange import MultiExchangeHandler, MarketOverview, CrossExchangeComparator, EXCHANGE_CONFIG
@@ -38,7 +41,7 @@ from fundamental_analysis import FundamentalAnalyzer
 from export_utils import ExportManager
 from auth import (register_user, authenticate, get_user_data,
                   save_user_watchlist, save_user_portfolio, save_user_alerts,
-                  save_user_settings, change_password)
+                  save_user_settings, save_user_trade_journal, change_password)
 
 warnings.filterwarnings("ignore")
 
@@ -609,15 +612,68 @@ def load_nifty500():
                      "APOLLOHOSP", "APOLLOTYRE", "ARVINDFARM", "ARVIND", "ASAHISONG"]
         return sorted(nifty50 + additional)
 
-@lru_cache(maxsize=500)
-def get_stock_data_cached(symbol, period="2y"):
-    """Cached stock data retrieval"""
+
+def fetch_realtime_nse_history(symbol, period="2y", interval="1d"):
+    """Fetch fresh NSE history and patch latest quote into the final candle."""
     try:
-        ticker = yf.Ticker(symbol + ".NS")
-        df = ticker.history(period=period)
-        return df if not df.empty and len(df) > 100 else None
-    except:
+        cleaned_symbol = str(symbol).strip().upper()
+        full_symbol = cleaned_symbol if cleaned_symbol.endswith(".NS") else f"{cleaned_symbol}.NS"
+
+        ticker = yf.Ticker(full_symbol)
+        df = ticker.history(period=period, interval=interval, auto_adjust=False, prepost=True)
+        if df is None or df.empty:
+            return None
+
+        df = df.copy()
+
+        live_price = None
+        live_volume = None
+        try:
+            fast_info = getattr(ticker, "fast_info", {}) or {}
+            live_price = fast_info.get("lastPrice") or fast_info.get("regularMarketPrice")
+            live_volume = fast_info.get("lastVolume") or fast_info.get("regularMarketVolume")
+        except Exception:
+            pass
+
+        if live_price is None:
+            try:
+                info = ticker.info or {}
+                live_price = info.get("regularMarketPrice") or info.get("currentPrice")
+                live_volume = live_volume or info.get("regularMarketVolume")
+            except Exception:
+                pass
+
+        if live_price is not None and len(df) > 0:
+            last_idx = df.index[-1]
+            live_price = float(live_price)
+            df.at[last_idx, "Close"] = live_price
+
+            if "High" in df.columns:
+                try:
+                    df.at[last_idx, "High"] = max(float(df.at[last_idx, "High"]), live_price)
+                except Exception:
+                    df.at[last_idx, "High"] = live_price
+
+            if "Low" in df.columns:
+                try:
+                    df.at[last_idx, "Low"] = min(float(df.at[last_idx, "Low"]), live_price)
+                except Exception:
+                    df.at[last_idx, "Low"] = live_price
+
+            if "Volume" in df.columns and live_volume is not None:
+                try:
+                    df.at[last_idx, "Volume"] = max(float(df.at[last_idx, "Volume"]), float(live_volume))
+                except Exception:
+                    pass
+
+        return df
+    except Exception:
         return None
+
+
+def get_stock_data_cached(symbol, period="2y"):
+    """Realtime stock data retrieval (legacy function name kept for compatibility)."""
+    return fetch_realtime_nse_history(symbol, period=period, interval="1d")
 
 # ============================================================================
 # STRATEGY ENGINE
@@ -937,11 +993,14 @@ class StockAnalyzer:
     def analyze_stock(self, symbol):
         """Comprehensive stock analysis"""
         try:
-            ticker = yf.Ticker(symbol + ".NS")
-            df = ticker.history(period="2y")
+            df = get_stock_data_cached(symbol, period="2y")
             
-            if df.empty:
+            if df is None or df.empty:
                 return None
+
+            cleaned_symbol = str(symbol).strip().upper()
+            full_symbol = cleaned_symbol if cleaned_symbol.endswith(".NS") else f"{cleaned_symbol}.NS"
+            ticker = yf.Ticker(full_symbol)
             
             df = compute_indicators(df)
             info = ticker.info
@@ -1133,6 +1192,644 @@ def format_number(num):
         return f"₹{num/1e5:.2f}L"
     else:
         return f"₹{num:.2f}"
+
+
+def _apply_hover_defaults_to_figure(fig):
+    """Ensure hover labels remain enabled on Plotly figures."""
+    if fig is None or not hasattr(fig, "update_layout"):
+        return
+
+    try:
+        current_hovermode = getattr(getattr(fig, "layout", None), "hovermode", None)
+        if current_hovermode in (None, "", False):
+            fig.update_layout(hovermode="x unified")
+
+        fig.update_layout(
+            hoverdistance=30,
+            spikedistance=30,
+            hoverlabel=dict(
+                namelength=-1,
+                bgcolor="rgba(8, 14, 30, 0.96)",
+                bordercolor="rgba(104, 180, 255, 0.85)",
+                font=dict(color="#F4F8FF", size=13, family="Segoe UI, Inter, sans-serif"),
+                align="left",
+            ),
+            transition=dict(duration=180, easing="cubic-in-out"),
+        )
+
+        fig.update_xaxes(
+            showspikes=True,
+            spikemode="across",
+            spikesnap="cursor",
+            spikethickness=1,
+            spikecolor="rgba(104, 180, 255, 0.65)",
+        )
+        fig.update_yaxes(
+            showspikes=True,
+            spikemode="across",
+            spikesnap="cursor",
+            spikethickness=1,
+            spikecolor="rgba(104, 180, 255, 0.45)",
+        )
+    except Exception:
+        pass
+
+    for trace in getattr(fig, "data", []):
+        try:
+            if getattr(trace, "hoverinfo", None) in ("skip", "none"):
+                trace.hoverinfo = "x+y+name"
+
+            trace_type = getattr(trace, "type", "")
+            has_template = bool(getattr(trace, "hovertemplate", None))
+
+            if trace_type in ("candlestick", "ohlc") and not has_template:
+                trace.hovertemplate = (
+                    "<b>%{x|%d %b %Y %H:%M}</b><br>"
+                    "Open: %{open:,.2f}<br>"
+                    "High: %{high:,.2f}<br>"
+                    "Low: %{low:,.2f}<br>"
+                    "Close: %{close:,.2f}"
+                    "<extra>%{fullData.name}</extra>"
+                )
+
+            if trace_type in ("scatter", "scattergl", "bar") and not has_template:
+                if hasattr(trace, "x") and hasattr(trace, "y"):
+                    trace.hovertemplate = (
+                        "<b>%{x|%d %b %Y %H:%M}</b><br>"
+                        "Value: %{y:,.2f}"
+                        "<extra>%{fullData.name}</extra>"
+                    )
+        except Exception:
+            continue
+
+
+def _merge_plotly_config(user_config=None):
+    """Merge app-level Plotly defaults with per-chart config overrides."""
+    merged = {
+        "displayModeBar": True,
+        "displaylogo": False,
+        "scrollZoom": True,
+        "doubleClick": "reset",
+        "responsive": True,
+        "staticPlot": False,
+    }
+    if isinstance(user_config, dict):
+        merged.update(user_config)
+    merged["staticPlot"] = False
+    merged["displayModeBar"] = True
+    return merged
+
+
+if not getattr(st.plotly_chart, "_artha_hover_patch", False):
+    _original_plotly_chart = st.plotly_chart
+
+    def _plotly_chart_with_hover(fig, *args, **kwargs):
+        _apply_hover_defaults_to_figure(fig)
+        user_config = kwargs.pop("config", None)
+        kwargs["config"] = _merge_plotly_config(user_config)
+        return _original_plotly_chart(fig, *args, **kwargs)
+
+    _plotly_chart_with_hover._artha_hover_patch = True
+    st.plotly_chart = _plotly_chart_with_hover
+
+
+def normalize_ticker_symbol(symbol):
+    """Normalize symbol text for reliable comparisons across UI inputs."""
+    cleaned = str(symbol).strip().upper()
+    for suffix in [".NS", ".BO", ".L"]:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[:-len(suffix)]
+    return cleaned
+
+
+def parse_symbol_list(raw_text):
+    """Parse comma/space/newline separated symbols and deduplicate them."""
+    if not raw_text:
+        return []
+
+    symbols = []
+    for token in re.split(r"[,;\s]+", raw_text):
+        symbol = normalize_ticker_symbol(token)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols
+
+
+def safe_parse_datetime(value):
+    """Parse ISO datetime safely, returning None for invalid values."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def build_trade_plan(account_capital, risk_pct, entry_price, stop_loss, target_price):
+    """Build a simple long-trade position sizing plan."""
+    if account_capital <= 0 or risk_pct <= 0 or entry_price <= 0 or stop_loss <= 0:
+        return {
+            "valid": False,
+            "error": "Capital, risk %, entry, and stop loss must be greater than zero.",
+        }
+
+    risk_per_share = entry_price - stop_loss
+    if risk_per_share <= 0:
+        return {
+            "valid": False,
+            "error": "Stop loss should be below entry price for a long setup.",
+        }
+
+    risk_budget = account_capital * (risk_pct / 100)
+    shares_by_risk = int(risk_budget / risk_per_share)
+    shares_by_capital = int(account_capital / entry_price)
+    shares = min(shares_by_risk, shares_by_capital)
+
+    if shares <= 0:
+        return {
+            "valid": False,
+            "error": "Risk budget is too small for this entry/stop configuration.",
+        }
+
+    reward_per_share = target_price - entry_price
+    position_value = shares * entry_price
+    potential_loss = shares * risk_per_share
+    potential_profit = shares * reward_per_share
+
+    return {
+        "valid": True,
+        "risk_budget": risk_budget,
+        "shares": shares,
+        "position_value": position_value,
+        "potential_loss": potential_loss,
+        "potential_profit": potential_profit,
+        "risk_reward": (potential_profit / potential_loss) if potential_loss > 0 else 0,
+        "capital_utilization_pct": (position_value / account_capital) * 100,
+        "risk_utilization_pct": (potential_loss / risk_budget) * 100 if risk_budget > 0 else 0,
+        "capital_limited": shares_by_capital < shares_by_risk,
+    }
+
+
+def compute_trade_scenario(entry_price, stop_loss, target_price, win_probability_pct, capital):
+    """Compute payoff and expectancy metrics for a custom long-trade scenario."""
+    if entry_price <= 0 or stop_loss <= 0 or target_price <= 0 or capital <= 0:
+        return {
+            "valid": False,
+            "error": "Entry, stop, target, and capital must be greater than zero.",
+        }
+
+    risk_per_share = entry_price - stop_loss
+    reward_per_share = target_price - entry_price
+
+    if risk_per_share <= 0:
+        return {
+            "valid": False,
+            "error": "Stop loss should be below entry for a long scenario.",
+        }
+
+    if reward_per_share <= 0:
+        return {
+            "valid": False,
+            "error": "Target should be above entry for a long scenario.",
+        }
+
+    win_probability = min(max(float(win_probability_pct), 0.0), 100.0) / 100.0
+    loss_probability = 1.0 - win_probability
+
+    shares = int(capital / entry_price)
+    if shares <= 0:
+        return {
+            "valid": False,
+            "error": "Capital is too small for even one share at this entry.",
+        }
+
+    pnl_if_win = shares * reward_per_share
+    pnl_if_loss = shares * risk_per_share
+    expected_value = (win_probability * pnl_if_win) - (loss_probability * pnl_if_loss)
+    breakeven_win_rate = (risk_per_share / (risk_per_share + reward_per_share)) * 100
+    payoff_ratio = reward_per_share / risk_per_share
+
+    return {
+        "valid": True,
+        "shares": shares,
+        "capital_used": shares * entry_price,
+        "risk_per_share": risk_per_share,
+        "reward_per_share": reward_per_share,
+        "risk_reward": payoff_ratio,
+        "pnl_if_win": pnl_if_win,
+        "pnl_if_loss": pnl_if_loss,
+        "expected_value": expected_value,
+        "expected_value_pct": (expected_value / (shares * entry_price)) * 100,
+        "breakeven_win_rate": breakeven_win_rate,
+        "expectancy_r": (win_probability * payoff_ratio) - loss_probability,
+    }
+
+
+def compute_analysis_confluence(analysis, prediction=None, news_data=None, fundamental_score=None):
+    """Create a weighted 0-100 confluence score from technical, ML, news, and fundamentals."""
+    rec_action = str((analysis.get("recommendation") or {}).get("action", "HOLD")).upper()
+    rec_score_map = {
+        "STRONG BUY": 92,
+        "BUY": 78,
+        "HOLD": 55,
+        "SELL": 32,
+        "STRONG SELL": 15,
+    }
+    recommendation_score = rec_score_map.get(rec_action, 50)
+
+    try:
+        rsi = float(analysis.get("rsi", 50) or 50)
+    except Exception:
+        rsi = 50
+    try:
+        adx = float(analysis.get("adx", 20) or 20)
+    except Exception:
+        adx = 20
+    try:
+        volume_ratio = float(analysis.get("volume_ratio", 1) or 1)
+    except Exception:
+        volume_ratio = 1
+
+    try:
+        macd = float(analysis.get("macd", 0) or 0)
+        macd_signal = float(analysis.get("macd_signal", 0) or 0)
+    except Exception:
+        macd = 0
+        macd_signal = 0
+
+    rsi_score = max(0.0, min(100.0, 100.0 - abs(rsi - 55.0) * 2.0))
+    adx_score = max(0.0, min(100.0, (adx / 40.0) * 100.0))
+    volume_score = max(0.0, min(100.0, volume_ratio * 50.0))
+    macd_score = 70.0 if macd > macd_signal else 35.0
+
+    technical_score = (
+        0.35 * rsi_score
+        + 0.30 * adx_score
+        + 0.20 * volume_score
+        + 0.15 * macd_score
+    )
+
+    prediction_confidence = float((prediction or {}).get("confidence", 50) or 50)
+    expected_return = float((prediction or {}).get("expected_return", 0) or 0)
+    expected_return_score = max(0.0, min(100.0, (expected_return + 10.0) * 2.5))
+    prediction_score = max(0.0, min(100.0, 0.7 * prediction_confidence + 0.3 * expected_return_score))
+
+    sentiment_raw = float((news_data or {}).get("sentiment_score", 0) or 0)
+    sentiment_score = max(0.0, min(100.0, (sentiment_raw + 1.0) * 50.0))
+
+    if fundamental_score is None:
+        fundamental_score = 50.0
+    fundamental_score = max(0.0, min(100.0, float(fundamental_score)))
+
+    overall_score = (
+        0.35 * technical_score
+        + 0.25 * prediction_score
+        + 0.15 * sentiment_score
+        + 0.15 * fundamental_score
+        + 0.10 * recommendation_score
+    )
+
+    if overall_score >= 75:
+        label = "High Conviction Bullish"
+    elif overall_score >= 60:
+        label = "Moderately Bullish"
+    elif overall_score >= 45:
+        label = "Neutral"
+    elif overall_score >= 30:
+        label = "Cautious"
+    else:
+        label = "High Risk / Bearish"
+
+    return {
+        "overall_score": overall_score,
+        "label": label,
+        "components": {
+            "technical": technical_score,
+            "prediction": prediction_score,
+            "sentiment": sentiment_score,
+            "fundamental": fundamental_score,
+            "recommendation": recommendation_score,
+        },
+    }
+
+
+def record_analysis_history(analysis, prediction=None, news_data=None):
+    """Append a compact stock-analysis snapshot to session history."""
+    if not analysis:
+        return
+
+    st.session_state.setdefault("analysis_history", [])
+
+    rec = analysis.get("recommendation", {}) if isinstance(analysis, dict) else {}
+    record = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": str(analysis.get("symbol", "")),
+        "company": str(analysis.get("company_name", "")),
+        "price": float(analysis.get("current_price", 0) or 0),
+        "recommendation": str(rec.get("action", "HOLD")),
+        "rec_score": float(rec.get("score", 0) or 0),
+        "prediction_confidence": float((prediction or {}).get("confidence", 0) or 0),
+        "expected_return": float((prediction or {}).get("expected_return", 0) or 0),
+        "news_sentiment": str((news_data or {}).get("overall_sentiment", "Neutral")),
+    }
+
+    st.session_state.analysis_history.append(record)
+    st.session_state.analysis_history = st.session_state.analysis_history[-100:]
+
+
+def resolve_stock_universe(selected_exchange, stock_list_option, exchange_lists):
+    """Resolve a screener stock-universe selection into concrete symbols."""
+    if stock_list_option == "All NSE Stocks":
+        return st.session_state.nse_stocks or []
+
+    if stock_list_option.startswith("All ") and stock_list_option.endswith(" Stocks"):
+        all_exchange_stocks = st.session_state.exchange_handler.load_exchange_stocks(selected_exchange)
+        if all_exchange_stocks:
+            return all_exchange_stocks
+
+        merged = []
+        for syms in exchange_lists.values():
+            merged.extend(syms)
+        return list(dict.fromkeys(merged))
+
+    if stock_list_option in exchange_lists:
+        return exchange_lists[stock_list_option]
+
+    fallback = st.session_state.exchange_handler.load_exchange_stocks(selected_exchange)
+    return fallback or []
+
+
+def compute_buy_opportunity_score(strategy_confidence, expected_return_pct, prediction_confidence, risk_reward):
+    """Compute a blended buy-opportunity score on a 0-100 scale."""
+    upside_score = min(max(expected_return_pct, 0), 25) * 4
+    risk_reward_score = min(max(risk_reward, 0), 4) * 25
+    return (
+        (0.50 * float(strategy_confidence))
+        + (0.25 * float(upside_score))
+        + (0.15 * float(prediction_confidence))
+        + (0.10 * float(risk_reward_score))
+    )
+
+
+def run_detailed_stock_analysis(symbol):
+    """Run stock, news, and prediction analysis and store it in session state."""
+    analysis = st.session_state.stock_analyzer.analyze_stock(symbol)
+    if not analysis:
+        return None, {}, None
+
+    st.session_state.current_analysis = analysis
+
+    try:
+        news_data = st.session_state.news_analyzer.analyze_stock_news(
+            symbol,
+            analysis.get("company_name", symbol),
+        )
+    except Exception:
+        news_data = {}
+    st.session_state.current_news = news_data
+
+    try:
+        prediction = st.session_state.price_predictor.predict_target_price(
+            analysis["df"],
+            sentiment_score=news_data.get("sentiment_score", 0),
+            fundamental_score=50,
+        )
+    except Exception:
+        prediction = None
+    st.session_state.current_prediction = prediction
+
+    record_analysis_history(analysis, prediction=prediction, news_data=news_data)
+
+    return analysis, news_data, prediction
+
+
+def save_journal_attachment(uploaded_file):
+    """Save uploaded journal attachment and return local filename."""
+    if uploaded_file is None:
+        return ""
+
+    attachments_dir = Path(__file__).parent / ".journal_attachments"
+    attachments_dir.mkdir(exist_ok=True)
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", uploaded_file.name)
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_name}"
+    path = attachments_dir / filename
+
+    with path.open("wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    return filename
+
+
+def _build_alert_payload(alert, current_price, status="triggered"):
+    """Build a consistent alert payload for downstream notification channels."""
+    target_price = float(alert.get("target_price", 0) or 0)
+    distance_pct = ((current_price / target_price) - 1) * 100 if target_price > 0 else 0
+    return {
+        "symbol": alert.get("symbol"),
+        "exchange": alert.get("exchange", "NSE"),
+        "condition": alert.get("condition"),
+        "target_price": target_price,
+        "current_price": current_price,
+        "distance_pct": distance_pct,
+        "status": status,
+        "note": alert.get("note", ""),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+def _send_webhook_alert(payload):
+    """Send alert payload to configured webhook endpoint."""
+    webhook_url = st.session_state.get("alert_webhook_url", "").strip()
+    if not webhook_url:
+        return False, "Webhook not configured"
+
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=8)
+        if 200 <= response.status_code < 300:
+            return True, f"Webhook delivered ({response.status_code})"
+        return False, f"Webhook failed ({response.status_code})"
+    except Exception as e:
+        return False, f"Webhook error: {e}"
+
+
+def _send_email_alert(payload):
+    """Send alert email via SMTP environment configuration."""
+    if not st.session_state.get("enable_email_alerts", False):
+        return False, "Email alerts disabled"
+
+    recipient = ((st.session_state.get("auth_user_data") or {}).get("email") or "").strip()
+    if not recipient:
+        return False, "No recipient email in user profile"
+
+    smtp_host = os.getenv("ALERT_SMTP_HOST", "").strip()
+    smtp_user = os.getenv("ALERT_SMTP_USER", "").strip()
+    smtp_pass = os.getenv("ALERT_SMTP_PASS", "").strip()
+    smtp_from = os.getenv("ALERT_SMTP_FROM", smtp_user).strip()
+    smtp_port = int(os.getenv("ALERT_SMTP_PORT", "587"))
+    use_tls = os.getenv("ALERT_SMTP_TLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+    if not (smtp_host and smtp_user and smtp_pass and smtp_from):
+        return False, "SMTP env vars missing"
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = (
+            f"[Artha Drishti] Alert {payload['symbol']} {payload['condition']} "
+            f"₹{payload['target_price']:.2f}"
+        )
+        msg["From"] = smtp_from
+        msg["To"] = recipient
+        msg.set_content(
+            "\n".join([
+                "Artha Drishti Price Alert",
+                f"Symbol: {payload['symbol']} ({payload['exchange']})",
+                f"Condition: price {payload['condition']} ₹{payload['target_price']:.2f}",
+                f"Current: ₹{payload['current_price']:.2f}",
+                f"Distance: {payload['distance_pct']:+.2f}%",
+                f"Status: {payload['status']}",
+                f"Time: {payload['timestamp']}",
+                f"Note: {payload.get('note', '')}",
+            ])
+        )
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
+            if use_tls:
+                server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+
+        return True, "Email delivered"
+    except Exception as e:
+        return False, f"Email error: {e}"
+
+
+def dispatch_alert_notification(alert, current_price, status="triggered"):
+    """Dispatch alert notifications across configured channels."""
+    payload = _build_alert_payload(alert, current_price, status=status)
+    webhook_ok, webhook_msg = _send_webhook_alert(payload)
+    email_ok, email_msg = _send_email_alert(payload)
+
+    channels = []
+    if webhook_ok:
+        channels.append("webhook")
+    if email_ok:
+        channels.append("email")
+    if not channels:
+        channels.append("in-app")
+
+    st.session_state.setdefault("recent_alert_notifications", [])
+    st.session_state.recent_alert_notifications.append({
+        "message": (
+            f"{payload['symbol']} {payload['condition']} ₹{payload['target_price']:.2f} "
+            f"(Now ₹{payload['current_price']:.2f})"
+        ),
+        "channels": channels,
+        "timestamp": payload["timestamp"],
+    })
+    st.session_state.recent_alert_notifications = st.session_state.recent_alert_notifications[-30:]
+
+    return {
+        "payload": payload,
+        "channels": channels,
+        "webhook_message": webhook_msg,
+        "email_message": email_msg,
+    }
+
+
+def process_price_alerts(force=False):
+    """Check active alerts, move expired alerts, and notify on triggered alerts."""
+    active_alerts = st.session_state.get("price_alerts", [])
+    if not active_alerts:
+        return {"checked": False, "triggered": [], "expired": []}
+
+    check_interval = int(st.session_state.get("alert_check_interval_sec", 60))
+    now_ts = time.time()
+    last_check = float(st.session_state.get("last_alert_check_ts", 0))
+
+    if not force and (now_ts - last_check) < max(10, check_interval):
+        return {"checked": False, "triggered": [], "expired": []}
+
+    st.session_state.last_alert_check_ts = now_ts
+
+    kept_alerts = []
+    triggered_events = []
+    expired_events = []
+    now_dt = datetime.now()
+    default_cooldown = int(st.session_state.get("alert_repeat_cooldown_min", 60))
+
+    for alert in active_alerts:
+        try:
+            expires_at = safe_parse_datetime(alert.get("expires_at"))
+            if expires_at and now_dt > expires_at:
+                expired_event = {
+                    **alert,
+                    "status": "expired",
+                    "triggered_at": now_dt.isoformat(),
+                    "triggered_price": alert.get("current_price"),
+                    "notification_channels": "none",
+                }
+                st.session_state.alert_history.append(expired_event)
+                expired_events.append(expired_event)
+                continue
+
+            data = st.session_state.exchange_handler.get_stock_data(
+                alert["symbol"], alert.get("exchange", "NSE"), period="5d"
+            )
+            if data is None or len(data) == 0:
+                kept_alerts.append(alert)
+                continue
+
+            current_price = float(data["Close"].iloc[-1])
+            alert["current_price"] = current_price
+
+            condition_met = False
+            if alert.get("condition") == "above" and current_price >= float(alert.get("target_price", 0)):
+                condition_met = True
+            elif alert.get("condition") == "below" and current_price <= float(alert.get("target_price", 0)):
+                condition_met = True
+
+            if not condition_met:
+                kept_alerts.append(alert)
+                continue
+
+            repeat_enabled = bool(alert.get("repeat", False))
+            cooldown_minutes = max(1, int(alert.get("cooldown_minutes", default_cooldown)))
+            last_triggered = safe_parse_datetime(alert.get("last_triggered_at"))
+
+            if repeat_enabled and last_triggered:
+                elapsed_seconds = (now_dt - last_triggered).total_seconds()
+                if elapsed_seconds < (cooldown_minutes * 60):
+                    kept_alerts.append(alert)
+                    continue
+
+            notify_meta = dispatch_alert_notification(alert, current_price, status="triggered")
+            event = {
+                **alert,
+                "status": "triggered",
+                "triggered_at": now_dt.isoformat(),
+                "triggered_price": current_price,
+                "notification_channels": ", ".join(notify_meta["channels"]),
+            }
+            st.session_state.alert_history.append(event)
+            triggered_events.append(event)
+
+            if repeat_enabled:
+                alert["last_triggered_at"] = now_dt.isoformat()
+                kept_alerts.append(alert)
+
+        except Exception:
+            kept_alerts.append(alert)
+
+    st.session_state.price_alerts = kept_alerts
+
+    if (triggered_events or expired_events) and st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+        try:
+            save_user_alerts(st.session_state.auth_username, st.session_state.price_alerts)
+        except Exception:
+            pass
+
+    return {"checked": True, "triggered": triggered_events, "expired": expired_events}
 
 # ============================================================================
 # STREAMLIT APP
@@ -1549,6 +2246,28 @@ st.markdown("""
     .sentiment-neutral:hover {
         transform: scale(1.05);
     }
+
+    .js-plotly-plot .plotly .hoverlayer .hovertext {
+        transition: transform 120ms ease-out, opacity 120ms ease-out;
+    }
+
+    .js-plotly-plot .plotly .hoverlayer .hovertext text {
+        fill: #f4f8ff !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.2px;
+    }
+
+    .js-plotly-plot .plotly .hoverlayer .hovertext rect {
+        fill: rgba(8, 14, 30, 0.96) !important;
+        stroke: rgba(104, 180, 255, 0.85) !important;
+        stroke-width: 1.2px !important;
+        filter: drop-shadow(0 8px 20px rgba(0, 0, 0, 0.45));
+    }
+
+    .js-plotly-plot .plotly .spikeline {
+        stroke: rgba(104, 180, 255, 0.62) !important;
+        stroke-width: 1.2px !important;
+    }
     
     button {
         transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
@@ -1610,12 +2329,19 @@ def _show_auth_page():
                         st.session_state.auth_username = login_user.strip().lower()
                         st.session_state.auth_user_data = result
                         # Restore saved watchlist / portfolio
-                        if result.get("watchlist"):
-                            st.session_state.watchlist = result["watchlist"]
-                        if result.get("portfolio"):
-                            st.session_state['_saved_portfolio'] = result["portfolio"]
-                        if result.get("alerts"):
-                            st.session_state['price_alerts'] = result["alerts"]
+                        st.session_state.watchlist = result.get("watchlist", [])
+                        st.session_state['_saved_portfolio'] = result.get("portfolio", [])
+                        st.session_state['price_alerts'] = result.get("alerts", [])
+                        st.session_state['trade_journal'] = result.get("trade_journal", [])
+
+                        saved_settings = result.get("settings", {}) if isinstance(result.get("settings", {}), dict) else {}
+                        if saved_settings:
+                            st.session_state.current_exchange = saved_settings.get("default_exchange", st.session_state.get("current_exchange", "NSE"))
+                            st.session_state.alert_webhook_url = saved_settings.get("alert_webhook_url", "")
+                            st.session_state.enable_email_alerts = bool(saved_settings.get("enable_email_alerts", False))
+                            st.session_state.alert_check_interval_sec = int(saved_settings.get("alert_check_interval_sec", 60))
+                            st.session_state.alert_repeat_cooldown_min = int(saved_settings.get("alert_repeat_cooldown_min", 60))
+                        st.session_state.user_settings_applied = False
                         st.success(f"Welcome back, {result.get('full_name') or login_user}!")
                         st.rerun()
                     else:
@@ -1643,11 +2369,16 @@ def _show_auth_page():
 
     with auth_tab3:
         st.markdown("### Continue as Guest")
-        st.info("Guest mode gives full access but your watchlist, portfolio, and alerts won't be saved between sessions.")
+        st.info("Guest mode gives full access but your watchlist, portfolio, alerts, and trade journal won't be saved between sessions.")
         if st.button("🚀 Continue as Guest", type="primary", use_container_width=True, key="guest_btn"):
             st.session_state.authenticated = True
             st.session_state.auth_username = "__guest__"
             st.session_state.auth_user_data = {}
+            st.session_state.watchlist = []
+            st.session_state.price_alerts = []
+            st.session_state.trade_journal = []
+            st.session_state._saved_portfolio = []
+            st.session_state.user_settings_applied = False
             st.rerun()
 
 
@@ -1660,6 +2391,10 @@ if 'nse_stocks' not in st.session_state:
     st.session_state.nse_stocks = None
 if 'screened_stocks' not in st.session_state:
     st.session_state.screened_stocks = None
+if 'best_buy_opportunities' not in st.session_state:
+    st.session_state.best_buy_opportunities = None
+if 'best_buy_context' not in st.session_state:
+    st.session_state.best_buy_context = {}
 if 'strategy_engine' not in st.session_state:
     st.session_state.strategy_engine = StrategyEngine()
 if 'ml_predictor' not in st.session_state:
@@ -1675,6 +2410,10 @@ if 'price_predictor' not in st.session_state:
 # --- NEW: Advanced module session state ---
 if 'exchange_handler' not in st.session_state:
     st.session_state.exchange_handler = MultiExchangeHandler()
+try:
+    st.session_state.exchange_handler.set_realtime_mode(True)
+except Exception:
+    pass
 if 'advanced_strategy_engine' not in st.session_state:
     st.session_state.advanced_strategy_engine = AdvancedStrategyEngine()
 if 'market_overview' not in st.session_state:
@@ -1705,11 +2444,88 @@ if 'price_alerts' not in st.session_state:
     st.session_state.price_alerts = []
 if 'alert_history' not in st.session_state:
     st.session_state.alert_history = []
+if 'trade_journal' not in st.session_state:
+    st.session_state.trade_journal = []
+if 'alert_webhook_url' not in st.session_state:
+    st.session_state.alert_webhook_url = ""
+if 'enable_email_alerts' not in st.session_state:
+    st.session_state.enable_email_alerts = False
+if 'alert_check_interval_sec' not in st.session_state:
+    st.session_state.alert_check_interval_sec = 60
+if 'alert_repeat_cooldown_min' not in st.session_state:
+    st.session_state.alert_repeat_cooldown_min = 60
+if 'last_alert_check_ts' not in st.session_state:
+    st.session_state.last_alert_check_ts = 0.0
+if 'recent_alert_notifications' not in st.session_state:
+    st.session_state.recent_alert_notifications = []
+if 'analysis_history' not in st.session_state:
+    st.session_state.analysis_history = []
+
+# Restore saved portfolio after login when available.
+if '_saved_portfolio' in st.session_state and st.session_state.get('_saved_portfolio'):
+    if not st.session_state.portfolio_manager.portfolio:
+        restored_portfolio = []
+        for item in st.session_state.get('_saved_portfolio', []):
+            if not isinstance(item, dict) or not item.get('symbol'):
+                continue
+            try:
+                quantity = int(item.get('quantity', 0))
+                buy_price = float(item.get('buy_price', 0))
+                if quantity <= 0 or buy_price <= 0:
+                    continue
+                restored_portfolio.append({
+                    'symbol': normalize_ticker_symbol(item.get('symbol')),
+                    'quantity': quantity,
+                    'buy_price': buy_price,
+                    'buy_date': str(item.get('buy_date', datetime.now().strftime('%Y-%m-%d'))),
+                })
+            except Exception:
+                continue
+        if restored_portfolio:
+            st.session_state.portfolio_manager.portfolio = restored_portfolio
+    st.session_state.pop('_saved_portfolio', None)
+
+# Apply saved profile settings once per authenticated session.
+if 'user_settings_applied' not in st.session_state:
+    st.session_state.user_settings_applied = False
+
+if not st.session_state.user_settings_applied:
+    saved_settings = (st.session_state.get('auth_user_data') or {}).get('settings', {})
+    if isinstance(saved_settings, dict) and saved_settings:
+        st.session_state.current_exchange = saved_settings.get('default_exchange', st.session_state.current_exchange)
+        st.session_state.alert_webhook_url = saved_settings.get('alert_webhook_url', st.session_state.alert_webhook_url)
+        st.session_state.enable_email_alerts = bool(saved_settings.get('enable_email_alerts', st.session_state.enable_email_alerts))
+        st.session_state.alert_check_interval_sec = int(saved_settings.get('alert_check_interval_sec', st.session_state.alert_check_interval_sec))
+        st.session_state.alert_repeat_cooldown_min = int(saved_settings.get('alert_repeat_cooldown_min', st.session_state.alert_repeat_cooldown_min))
+
+        if 'risk_free_rate' in saved_settings:
+            try:
+                loaded_rfr = float(saved_settings.get('risk_free_rate'))
+                st.session_state.risk_analytics.risk_free_rate = loaded_rfr / 100
+                st.session_state.portfolio_risk.risk_analytics.risk_free_rate = loaded_rfr / 100
+            except Exception:
+                pass
+
+    st.session_state.user_settings_applied = True
 
 # Load NSE stocks
 if st.session_state.nse_stocks is None:
     with st.spinner("Loading NSE stocks..."):
         st.session_state.nse_stocks = load_nse_stocks()
+
+# Background-style alert polling on each rerun with interval throttling.
+poll_result = process_price_alerts(force=False)
+if poll_result.get("triggered"):
+    for event in poll_result["triggered"][:3]:
+        st.toast(
+            f"Alert: {event['symbol']} {event['condition']} ₹{event['target_price']:.2f} (Now ₹{event.get('triggered_price', 0):.2f})",
+            icon="🔔",
+        )
+    if len(poll_result["triggered"]) > 3:
+        st.toast(f"{len(poll_result['triggered']) - 3} more alert(s) triggered.", icon="ℹ️")
+
+if poll_result.get("expired"):
+    st.toast(f"{len(poll_result['expired'])} alert(s) expired.", icon="⏱️")
 
 # Header with centered logo
 st.markdown("""
@@ -1755,8 +2571,24 @@ with header_col3:
                                         st.session_state.get('watchlist', []))
                 except Exception:
                     pass
+                try:
+                    save_user_portfolio(st.session_state.auth_username,
+                                        st.session_state.portfolio_manager.portfolio)
+                except Exception:
+                    pass
+                try:
+                    save_user_alerts(st.session_state.auth_username,
+                                     st.session_state.get('price_alerts', []))
+                except Exception:
+                    pass
+                try:
+                    save_user_trade_journal(st.session_state.auth_username,
+                                            st.session_state.get('trade_journal', []))
+                except Exception:
+                    pass
             for k in ['authenticated', 'auth_username', 'auth_user_data']:
                 st.session_state[k] = False if k == 'authenticated' else None
+            st.session_state.user_settings_applied = False
             st.rerun()
 
 st.markdown("""
@@ -1831,7 +2663,8 @@ nav_col9, nav_col10, nav_col11, nav_col12 = st.columns(4, gap="small")
 
 nav_buttons_row3 = [
     ("Price Alerts", "btn_alerts", nav_col9),
-    ("Settings", "btn_settings", nav_col10),
+    ("Trade Journal", "btn_journal", nav_col10),
+    ("Settings", "btn_settings", nav_col11),
 ]
 
 for btn_text, btn_key, col in nav_buttons_row3:
@@ -2261,63 +3094,240 @@ if page == "Stock Screener":
     exchange_info = st.session_state.exchange_handler.get_exchange_info(selected_exchange)
     st.info(f"**Strategy:** {strat['description']} | **Risk:** {strat.get('risk_level', 'N/A')} | "
             f"**Timeframe:** {strat.get('timeframe', 'N/A')} | **Exchange:** {exchange_info.get('name', selected_exchange)}")
+
+    stocks_to_scan = resolve_stock_universe(selected_exchange, stock_list_option, exchange_lists)
     
     if st.button("Start Screening", type="primary", use_container_width=True):
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
-        if stock_list_option == "All NSE Stocks":
-            stocks_to_scan = st.session_state.nse_stocks
-        elif stock_list_option.startswith("All ") and stock_list_option.endswith(" Stocks"):
-            # "All {EXCHANGE} Stocks" - load all stocks for the exchange
-            all_exchange_stocks = st.session_state.exchange_handler.load_exchange_stocks(selected_exchange)
-            if all_exchange_stocks:
-                stocks_to_scan = all_exchange_stocks
-            else:
-                # Fallback: merge all available list groups for the exchange
-                merged = []
-                for grp, syms in exchange_lists.items():
-                    merged.extend(syms)
-                stocks_to_scan = list(dict.fromkeys(merged))  # deduplicate preserving order
-        elif stock_list_option in exchange_lists:
-            stocks_to_scan = exchange_lists[stock_list_option]
+        if not stocks_to_scan:
+            progress_bar.empty()
+            status_text.empty()
+            st.warning("No stocks available in this universe. Try another list or exchange.")
         else:
-            stocks_to_scan = st.session_state.exchange_handler.load_exchange_stocks(selected_exchange)
-        
-        results = []
-        currency = st.session_state.exchange_handler.get_currency_symbol(selected_exchange)
-        
-        for i, symbol in enumerate(stocks_to_scan):
-            status_text.text(f"Screening {symbol}... ({i+1}/{len(stocks_to_scan)})")
-            
-            try:
-                df = st.session_state.exchange_handler.get_stock_data(symbol, selected_exchange)
-                if df is None:
-                    continue
-                
-                result = st.session_state.advanced_strategy_engine.evaluate_strategy(df, strategy_name)
-                
-                if result and result['confidence'] >= min_confidence:
-                    current_price = df['Close'].iloc[-1]
-                    
-                    # Get quick price predictions
+            results = []
+
+            total_symbols = len(stocks_to_scan)
+            status_text.text(f"Fetching realtime data for {total_symbols} symbols...")
+            progress_bar.progress(0.05)
+
+            data_map = st.session_state.exchange_handler.get_bulk_stock_data(
+                stocks_to_scan,
+                selected_exchange,
+                period="2y",
+                interval="1d",
+                include_live_quote=True,
+            )
+            bulk_meta = st.session_state.exchange_handler.get_last_bulk_meta()
+            if bulk_meta:
+                status_text.text(
+                    f"Fetched {bulk_meta.get('fetched', 0)}/{bulk_meta.get('requested', total_symbols)} symbols "
+                    f"using {bulk_meta.get('workers_min', 1)}-{bulk_meta.get('workers_max', 1)} workers"
+                )
+
+            for i, symbol in enumerate(stocks_to_scan):
+                status_text.text(f"Scoring {symbol}... ({i+1}/{total_symbols})")
+
+                try:
+                    df = data_map.get(str(symbol).strip().upper())
+                    if df is None:
+                        continue
+
+                    result = st.session_state.advanced_strategy_engine.evaluate_strategy(df, strategy_name)
+
+                    if result and result['confidence'] >= min_confidence:
+                        current_price = float(df['Close'].iloc[-1])
+
+                        # Quick price levels for shortlist display.
+                        try:
+                            prediction = st.session_state.price_predictor.predict_target_price(
+                                df, sentiment_score=0, fundamental_score=50
+                            )
+                            buy_price = float(prediction['buy_price']) if prediction else current_price * 0.98
+                            target_price = float(prediction['target_price']) if prediction else current_price * 1.05
+                            stop_loss = float(prediction['stop_loss']) if prediction else current_price * 0.97
+                            expected_return = float(prediction['expected_return']) if prediction else 5.0
+                            pred_confidence = float(prediction['confidence']) if prediction else 50.0
+                        except Exception:
+                            buy_price = current_price * 0.98
+                            target_price = current_price * 1.05
+                            stop_loss = current_price * 0.97
+                            expected_return = 5.0
+                            pred_confidence = 50.0
+
+                        results.append({
+                            'Symbol': symbol,
+                            'Exchange': selected_exchange,
+                            'Current Price': current_price,
+                            'Buy Price': buy_price,
+                            'Target Price': target_price,
+                            'Stop Loss': stop_loss,
+                            'Expected Return %': expected_return,
+                            'Strategy Confidence': result['confidence'],
+                            'Prediction Confidence': pred_confidence,
+                            'Conditions Met': result['conditions_met'],
+                            'Total Conditions': result['total_conditions'],
+                            'Category': result.get('category', 'N/A'),
+                            'Risk Level': result.get('risk_level', 'N/A'),
+                        })
+                except Exception:
+                    pass
+
+                progress_bar.progress(0.05 + ((i + 1) / max(1, total_symbols)) * 0.95)
+
+            status_text.text("Screening Complete!")
+
+            if results:
+                st.session_state.screened_stocks = pd.DataFrame(results).sort_values(
+                    'Strategy Confidence', ascending=False
+                )
+                st.success(f"Found {len(results)} stocks matching criteria!")
+            else:
+                st.warning("No stocks found. Try adjusting filters.")
+
+    st.markdown("---")
+    st.markdown("## Best Possible Buys (By Exchange)")
+    st.caption("Ranks opportunities using strategy confidence, expected upside, risk/reward, and prediction confidence.")
+
+    best_use_all_exchange = st.checkbox(
+        f"Use all stocks from {selected_exchange} for best buys",
+        value=stock_list_option.startswith("All "),
+        key="best_buy_use_all_exchange",
+    )
+
+    if best_use_all_exchange:
+        best_buy_universe = resolve_stock_universe(
+            selected_exchange,
+            f"All {selected_exchange} Stocks",
+            exchange_lists,
+        )
+        best_universe_label = f"All {selected_exchange} Stocks"
+    else:
+        best_buy_universe = stocks_to_scan
+        best_universe_label = stock_list_option
+
+    universe_count = len(best_buy_universe)
+    if universe_count > 0:
+        st.caption(f"Universe selected: {best_universe_label} | Available symbols: {universe_count}")
+    else:
+        st.info("No symbols available for this exchange/list combination.")
+
+    scan_limit_max = max(1, universe_count)
+    default_scan_limit = min(75, scan_limit_max)
+
+    bb_col1, bb_col2, bb_col3, bb_col4 = st.columns(4)
+    with bb_col1:
+        best_scan_all = st.checkbox(
+            "Evaluate complete universe",
+            value=universe_count <= 75 and universe_count > 0,
+            disabled=universe_count == 0,
+            key="best_buy_scan_all",
+        )
+    with bb_col2:
+        best_scan_limit = int(
+            st.number_input(
+                "Stocks to evaluate",
+                min_value=1,
+                max_value=scan_limit_max,
+                value=default_scan_limit,
+                step=1,
+                disabled=best_scan_all,
+                key="best_buy_scan_limit",
+            )
+        )
+    if best_scan_all and universe_count > 0:
+        best_scan_limit = universe_count
+
+    with bb_col3:
+        best_top_n = int(
+            st.number_input(
+                "Top buy ideas",
+                min_value=1,
+                max_value=max(1, best_scan_limit),
+                value=min(10, best_scan_limit),
+                step=1,
+                key="best_buy_top_n",
+            )
+        )
+    with bb_col4:
+        best_min_conf = st.slider(
+            "Min confidence for best buys",
+            30,
+            90,
+            max(55, min_confidence),
+            key="best_buy_min_conf",
+        )
+
+    if st.button(
+        "Find Best Possible Buys",
+        type="primary",
+        use_container_width=True,
+        key="best_buy_scan_btn",
+        disabled=universe_count == 0,
+    ):
+        if universe_count == 0:
+            st.warning("No symbols available to evaluate.")
+        else:
+            symbols_to_evaluate = best_buy_universe[:best_scan_limit]
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            best_results = []
+
+            total_symbols = len(symbols_to_evaluate)
+            status_text.text(f"Fetching realtime data for {total_symbols} symbols...")
+            progress_bar.progress(0.05)
+
+            data_map = st.session_state.exchange_handler.get_bulk_stock_data(
+                symbols_to_evaluate,
+                selected_exchange,
+                period="2y",
+                interval="1d",
+                include_live_quote=True,
+            )
+            bulk_meta = st.session_state.exchange_handler.get_last_bulk_meta()
+            if bulk_meta:
+                status_text.text(
+                    f"Fetched {bulk_meta.get('fetched', 0)}/{bulk_meta.get('requested', total_symbols)} symbols "
+                    f"using {bulk_meta.get('workers_min', 1)}-{bulk_meta.get('workers_max', 1)} workers"
+                )
+
+            for i, symbol in enumerate(symbols_to_evaluate):
+                status_text.text(f"Evaluating {symbol}... ({i+1}/{total_symbols})")
+
+                try:
+                    df = data_map.get(str(symbol).strip().upper())
+                    if df is None or len(df) < 50:
+                        continue
+
+                    result = st.session_state.advanced_strategy_engine.evaluate_strategy(df, strategy_name)
+                    if not result or result.get('confidence', 0) < best_min_conf:
+                        continue
+
+                    current_price = float(df['Close'].iloc[-1])
                     try:
                         prediction = st.session_state.price_predictor.predict_target_price(
                             df, sentiment_score=0, fundamental_score=50
                         )
-                        buy_price = prediction['buy_price'] if prediction else current_price * 0.98
-                        target_price = prediction['target_price'] if prediction else current_price * 1.05
-                        stop_loss = prediction['stop_loss'] if prediction else current_price * 0.97
-                        expected_return = prediction['expected_return'] if prediction else 5.0
-                        pred_confidence = prediction['confidence'] if prediction else 50
-                    except:
-                        buy_price = current_price * 0.98
-                        target_price = current_price * 1.05
-                        stop_loss = current_price * 0.97
-                        expected_return = 5.0
-                        pred_confidence = 50
-                    
-                    results.append({
+                    except Exception:
+                        prediction = None
+
+                    buy_price = float(prediction['buy_price']) if prediction else current_price * 0.98
+                    target_price = float(prediction['target_price']) if prediction else current_price * 1.05
+                    stop_loss = float(prediction['stop_loss']) if prediction else current_price * 0.97
+                    expected_return = float(prediction['expected_return']) if prediction else ((target_price / current_price) - 1) * 100
+                    pred_confidence = float(prediction['confidence']) if prediction else 50.0
+
+                    risk_pct = ((current_price - stop_loss) / current_price) * 100 if current_price > 0 else 0
+                    risk_pct = max(risk_pct, 0.01)
+                    risk_reward = expected_return / risk_pct
+                    buy_score = compute_buy_opportunity_score(
+                        result.get('confidence', 0),
+                        expected_return,
+                        pred_confidence,
+                        risk_reward,
+                    )
+
+                    best_results.append({
                         'Symbol': symbol,
                         'Exchange': selected_exchange,
                         'Current Price': current_price,
@@ -2325,27 +3335,110 @@ if page == "Stock Screener":
                         'Target Price': target_price,
                         'Stop Loss': stop_loss,
                         'Expected Return %': expected_return,
-                        'Strategy Confidence': result['confidence'],
+                        'Risk %': risk_pct,
+                        'Risk/Reward': risk_reward,
+                        'Strategy Confidence': float(result.get('confidence', 0)),
                         'Prediction Confidence': pred_confidence,
-                        'Conditions Met': result['conditions_met'],
-                        'Total Conditions': result['total_conditions'],
+                        'Buy Score': float(buy_score),
                         'Category': result.get('category', 'N/A'),
                         'Risk Level': result.get('risk_level', 'N/A'),
                     })
-            except:
-                pass
-            
-            progress_bar.progress((i + 1) / len(stocks_to_scan))
-        
-        status_text.text("Screening Complete!")
-        
-        if results:
-            st.session_state.screened_stocks = pd.DataFrame(results).sort_values(
-                'Strategy Confidence', ascending=False
+                except Exception:
+                    pass
+
+                progress_bar.progress(0.05 + ((i + 1) / max(1, total_symbols)) * 0.95)
+
+            status_text.text("Best-buy scan complete!")
+
+            if best_results:
+                best_df = pd.DataFrame(best_results).sort_values(
+                    ['Buy Score', 'Strategy Confidence', 'Expected Return %'],
+                    ascending=[False, False, False],
+                ).head(best_top_n).reset_index(drop=True)
+                best_df.insert(0, 'Rank', np.arange(1, len(best_df) + 1))
+
+                st.session_state.best_buy_opportunities = best_df
+                st.session_state.best_buy_context = {
+                    'exchange': selected_exchange,
+                    'stock_list_option': best_universe_label,
+                    'strategy': strategy_name,
+                    'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'symbols_evaluated': len(symbols_to_evaluate),
+                }
+                st.success(f"Found {len(best_df)} high-potential buy opportunities.")
+            else:
+                st.session_state.best_buy_opportunities = None
+                st.warning("No best-buy opportunities found. Try lowering confidence or scanning more stocks.")
+
+    if st.session_state.best_buy_opportunities is not None:
+        best_ctx = st.session_state.get('best_buy_context', {})
+        best_df = st.session_state.best_buy_opportunities.copy()
+
+        st.markdown("### Top Buy Opportunities")
+        st.caption(
+            f"Generated: {best_ctx.get('generated_at', 'N/A')} | "
+            f"Exchange: {best_ctx.get('exchange', 'N/A')} | "
+            f"Strategy: {best_ctx.get('strategy', 'N/A')} | "
+            f"Symbols Evaluated: {best_ctx.get('symbols_evaluated', 0)}"
+        )
+
+        met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+        with met_col1:
+            st.metric("Top Ideas", len(best_df))
+        with met_col2:
+            st.metric("Avg Buy Score", f"{best_df['Buy Score'].mean():.1f}")
+        with met_col3:
+            st.metric("Avg Expected Return", f"{best_df['Expected Return %'].mean():.2f}%")
+        with met_col4:
+            st.metric("Best Symbol", best_df.iloc[0]['Symbol'])
+
+        best_currency = st.session_state.exchange_handler.get_currency_symbol(
+            best_ctx.get('exchange', selected_exchange)
+        )
+        display_best_df = best_df.copy()
+        display_best_df['Current Price'] = display_best_df['Current Price'].map(lambda x: f"{best_currency}{x:.2f}")
+        display_best_df['Buy Price'] = display_best_df['Buy Price'].map(lambda x: f"{best_currency}{x:.2f}")
+        display_best_df['Target Price'] = display_best_df['Target Price'].map(lambda x: f"{best_currency}{x:.2f}")
+        display_best_df['Stop Loss'] = display_best_df['Stop Loss'].map(lambda x: f"{best_currency}{x:.2f}")
+        display_best_df['Expected Return %'] = display_best_df['Expected Return %'].map(lambda x: f"{x:.2f}%")
+        display_best_df['Risk %'] = display_best_df['Risk %'].map(lambda x: f"{x:.2f}%")
+        display_best_df['Risk/Reward'] = display_best_df['Risk/Reward'].map(lambda x: f"{x:.2f}")
+        display_best_df['Strategy Confidence'] = display_best_df['Strategy Confidence'].map(lambda x: f"{x:.1f}%")
+        display_best_df['Prediction Confidence'] = display_best_df['Prediction Confidence'].map(lambda x: f"{x:.1f}%")
+        display_best_df['Buy Score'] = display_best_df['Buy Score'].map(lambda x: f"{x:.1f}")
+
+        st.dataframe(display_best_df, use_container_width=True, height=320)
+
+        act_col1, act_col2 = st.columns(2)
+        with act_col1:
+            best_csv = best_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Best Buys",
+                best_csv,
+                f"best_buys_{best_ctx.get('exchange', selected_exchange)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True,
+                key="best_buys_download",
             )
-            st.success(f"Found {len(results)} stocks matching criteria!")
-        else:
-            st.warning("No stocks found. Try adjusting filters.")
+
+        with act_col2:
+            selected_best_symbol = st.selectbox(
+                "Select best buy for detailed analysis",
+                best_df['Symbol'].tolist(),
+                key="best_buy_detail_select",
+            )
+
+        if st.button("🔍 Analyze Selected Best Buy", type="primary", use_container_width=True, key="best_buy_analyze"):
+            with st.spinner(f"Analyzing {selected_best_symbol}..."):
+                analysis, news_data, prediction = run_detailed_stock_analysis(selected_best_symbol)
+
+                if analysis:
+                    st.success(f"Analysis complete! Scroll down to view detailed analysis of {selected_best_symbol}")
+                    st.markdown("---")
+                    st.markdown(f"## Detailed Analysis: {selected_best_symbol}")
+                    _display_stock_analysis(analysis, news_data, prediction)
+                else:
+                    st.error("Failed to analyze stock")
     
     # Display results
     if st.session_state.screened_stocks is not None:
@@ -2401,35 +3494,12 @@ if page == "Stock Screener":
         
         if st.button("🔍 Analyze Selected Stock", type="primary", use_container_width=True):
             with st.spinner(f"Analyzing {selected_symbol}..."):
-                # Switch to analysis page and analyze
-                analysis = st.session_state.stock_analyzer.analyze_stock(selected_symbol)
-                
+                analysis, news_data, prediction = run_detailed_stock_analysis(selected_symbol)
+
                 if analysis:
-                    st.session_state.current_analysis = analysis
-                    
-                    # Get news sentiment
-                    with st.spinner("Analyzing news sentiment..."):
-                        news_data = st.session_state.news_analyzer.analyze_stock_news(
-                            selected_symbol, analysis.get('company_name', selected_symbol)
-                        )
-                        st.session_state.current_news = news_data
-                    
-                    # Get price prediction
-                    with st.spinner("Predicting target prices..."):
-                        prediction = st.session_state.price_predictor.predict_target_price(
-                            analysis['df'],
-                            sentiment_score=news_data['sentiment_score'],
-                            fundamental_score=50
-                        )
-                        st.session_state.current_prediction = prediction
-                    
                     st.success(f"Analysis complete! Scroll down to view detailed analysis of {selected_symbol}")
-                    
-                    # Display analysis immediately below
                     st.markdown("---")
                     st.markdown(f"## Detailed Analysis: {selected_symbol}")
-                    
-                    # Show the full analysis
                     _display_stock_analysis(analysis, news_data, prediction)
                 else:
                     st.error("Failed to analyze stock")
@@ -2577,10 +3647,30 @@ elif page == "Multi-Strategy":
             results_list = []
             progress = st.progress(0)
 
-            for idx, sym in enumerate(batch_stocks[:max_stocks]):
-                progress.progress((idx + 1) / max_stocks, text=f"Screening {sym}...")
+            symbols_to_screen = batch_stocks[:max_stocks]
+            progress.progress(0.05, text=f"Fetching realtime data for {len(symbols_to_screen)} stocks...")
+
+            data_map = st.session_state.exchange_handler.get_bulk_stock_data(
+                symbols_to_screen,
+                batch_exchange,
+                period="2y",
+                interval="1d",
+                include_live_quote=True,
+            )
+            bulk_meta = st.session_state.exchange_handler.get_last_bulk_meta()
+            if bulk_meta:
+                latency_ema = bulk_meta.get('latency_ema')
+                latency_ema_text = f"{float(latency_ema):.3f}s" if latency_ema is not None else "N/A"
+                st.caption(
+                    f"Realtime fetch: {bulk_meta.get('fetched', 0)}/{bulk_meta.get('requested', len(symbols_to_screen))} symbols | "
+                    f"Workers: {bulk_meta.get('workers_min', 1)}-{bulk_meta.get('workers_max', 1)} | "
+                    f"Adaptive latency EMA: {latency_ema_text}"
+                )
+
+            for idx, sym in enumerate(symbols_to_screen):
+                progress.progress(0.05 + ((idx + 1) / max(1, len(symbols_to_screen))) * 0.95, text=f"Screening {sym}...")
                 try:
-                    df = st.session_state.exchange_handler.get_stock_data(sym, batch_exchange)
+                    df = data_map.get(str(sym).strip().upper())
                     if df is not None and len(df) >= 50:
                         screen = st.session_state.advanced_strategy_engine.multi_strategy_screen(
                             df, min_confidence=batch_min_conf
@@ -3173,13 +4263,11 @@ elif page == "Market Overview":
         st.markdown("### Global Market Indices")
 
         if st.button("🔄 Refresh Indices", key="mo_refresh"):
-            st.session_state.pop('cached_indices', None)
+            st.rerun()
 
         with st.spinner("Loading global indices..."):
-            if 'cached_indices' not in st.session_state:
-                st.session_state.cached_indices = st.session_state.market_overview.get_all_indices()
-
-            indices = st.session_state.cached_indices
+            indices = st.session_state.market_overview.get_all_indices()
+            st.caption(f"Live snapshot refreshed: {datetime.now().strftime('%H:%M:%S')}")
 
             if indices:
                 cols = st.columns(len(indices))
@@ -3451,7 +4539,7 @@ elif page == "Market Overview":
 elif page == "Portfolio":
     st.markdown("## Portfolio Management")
     
-    tab1, tab2, tab3 = st.tabs(["My Portfolio", "Add Stock", "Analysis"])
+    tab1, tab2, tab3, tab4 = st.tabs(["My Portfolio", "Add Stock", "Analysis", "Allocation & Rebalance"])
     
     with tab1:
         st.markdown("### My Portfolio")
@@ -3487,6 +4575,14 @@ elif page == "Portfolio":
                 )
                 if st.button("Remove"):
                     st.session_state.portfolio_manager.remove_stock(stock_to_remove)
+                    if st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+                        try:
+                            save_user_portfolio(
+                                st.session_state.auth_username,
+                                st.session_state.portfolio_manager.portfolio,
+                            )
+                        except Exception:
+                            pass
                     st.rerun()
         else:
             st.info("📊 Your portfolio is empty. Add stocks to get started!")
@@ -3507,6 +4603,14 @@ elif page == "Portfolio":
         
         if st.button("Add to Portfolio", type="primary"):
             st.session_state.portfolio_manager.add_stock(symbol, quantity, buy_price)
+            if st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+                try:
+                    save_user_portfolio(
+                        st.session_state.auth_username,
+                        st.session_state.portfolio_manager.portfolio,
+                    )
+                except Exception:
+                    pass
             st.success(f"Added {quantity} shares of {symbol} to portfolio!")
             st.rerun()
     
@@ -3549,6 +4653,149 @@ elif page == "Portfolio":
         else:
             st.info("Add stocks to your portfolio first!")
 
+    with tab4:
+        st.markdown("### Allocation & Rebalance Assistant")
+        st.caption("Detect drift versus target allocation, position-size risk breaches, and sector concentration.")
+
+        if st.session_state.portfolio_manager.portfolio:
+            pf_summary = st.session_state.portfolio_manager.analyze_portfolio()
+            if pf_summary and pf_summary.get("stocks"):
+                rebalance_df = pd.DataFrame(pf_summary["stocks"]).copy()
+                rebalance_df["Current Value"] = pd.to_numeric(rebalance_df["Current Value"], errors="coerce").fillna(0.0)
+                total_current_value = float(rebalance_df["Current Value"].sum())
+
+                if total_current_value <= 0:
+                    st.warning("Portfolio current value is unavailable for rebalance calculations.")
+                else:
+                    rb_col1, rb_col2, rb_col3 = st.columns(3)
+                    with rb_col1:
+                        use_equal_weight = st.checkbox("Use equal-weight targets", value=True, key="rb_equal_weight")
+                    with rb_col2:
+                        max_position_pct = st.slider("Max position weight (%)", 5, 60, 25, key="rb_max_pos")
+                    with rb_col3:
+                        max_sector_pct = st.slider("Max sector exposure (%)", 10, 90, 40, key="rb_max_sector")
+
+                    symbols = rebalance_df["Symbol"].tolist()
+                    target_inputs = {}
+                    if use_equal_weight:
+                        equal_target = 100 / len(symbols)
+                        target_inputs = {s: equal_target for s in symbols}
+                        st.info(f"Equal-weight target applied: {equal_target:.2f}% per stock")
+                    else:
+                        st.markdown("#### Target Weights")
+                        target_cols = st.columns(min(4, len(symbols)))
+                        for i, sym in enumerate(symbols):
+                            with target_cols[i % len(target_cols)]:
+                                target_inputs[sym] = st.number_input(
+                                    f"{sym} (%)",
+                                    min_value=0.0,
+                                    max_value=100.0,
+                                    value=round(100 / len(symbols), 2),
+                                    step=0.5,
+                                    key=f"rb_target_{sym}",
+                                )
+                        st.caption(f"Target sum: {sum(target_inputs.values()):.2f}%")
+
+                    target_total = sum(target_inputs.values())
+                    if target_total <= 0:
+                        st.warning("Target allocation sum must be greater than 0.")
+                    else:
+                        plan_rows = []
+                        for _, row in rebalance_df.iterrows():
+                            sym = row["Symbol"]
+                            current_value = float(row["Current Value"])
+                            current_weight = (current_value / total_current_value) * 100 if total_current_value > 0 else 0
+                            target_weight = (target_inputs.get(sym, 0) / target_total) * 100
+                            target_value = total_current_value * (target_weight / 100)
+                            rebalance_amount = target_value - current_value
+
+                            if rebalance_amount > 0.01:
+                                action = "BUY"
+                            elif rebalance_amount < -0.01:
+                                action = "SELL"
+                            else:
+                                action = "HOLD"
+
+                            plan_rows.append({
+                                "Symbol": sym,
+                                "Current Weight %": round(current_weight, 2),
+                                "Target Weight %": round(target_weight, 2),
+                                "Drift %": round(current_weight - target_weight, 2),
+                                "Current Value": round(current_value, 2),
+                                "Target Value": round(target_value, 2),
+                                "Action": action,
+                                "Rebalance Amount": round(abs(rebalance_amount), 2),
+                                "Risk Breach": "Yes" if current_weight > max_position_pct else "No",
+                            })
+
+                        plan_df = pd.DataFrame(plan_rows)
+                        st.markdown("#### Rebalance Plan")
+                        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+                        risk_breaches = plan_df[plan_df["Risk Breach"] == "Yes"]
+                        if not risk_breaches.empty:
+                            st.warning(f"{len(risk_breaches)} position(s) exceed max position weight of {max_position_pct}%.")
+                        else:
+                            st.success("No single-position risk breaches detected.")
+
+                        # Sector concentration analysis
+                        if "portfolio_sector_cache" not in st.session_state:
+                            st.session_state.portfolio_sector_cache = {}
+
+                        if st.button("🔄 Refresh Sector Mapping", key="rb_refresh_sector"):
+                            st.session_state.portfolio_sector_cache = {}
+
+                        sector_totals = {}
+                        for _, row in rebalance_df.iterrows():
+                            sym = row["Symbol"]
+                            current_value = float(row["Current Value"])
+
+                            if sym in st.session_state.portfolio_sector_cache:
+                                sector = st.session_state.portfolio_sector_cache[sym]
+                            else:
+                                try:
+                                    sym_analysis = st.session_state.stock_analyzer.analyze_stock(sym)
+                                    sector = sym_analysis.get("sector", "Unknown") if sym_analysis else "Unknown"
+                                except Exception:
+                                    sector = "Unknown"
+                                st.session_state.portfolio_sector_cache[sym] = sector
+
+                            sector_totals[sector] = sector_totals.get(sector, 0.0) + current_value
+
+                        sector_rows = []
+                        for sector, value in sector_totals.items():
+                            weight = (value / total_current_value) * 100 if total_current_value > 0 else 0
+                            sector_rows.append({
+                                "Sector": sector,
+                                "Value": round(value, 2),
+                                "Weight %": round(weight, 2),
+                                "Breach": "Yes" if weight > max_sector_pct else "No",
+                            })
+
+                        sector_df = pd.DataFrame(sector_rows).sort_values("Weight %", ascending=False)
+                        st.markdown("#### Sector Concentration")
+                        st.dataframe(sector_df, use_container_width=True, hide_index=True)
+
+                        sector_breaches = sector_df[sector_df["Breach"] == "Yes"]
+                        if not sector_breaches.empty:
+                            st.warning(f"{len(sector_breaches)} sector(s) exceed max sector exposure of {max_sector_pct}%.")
+                        else:
+                            st.success("Sector exposure is within configured limits.")
+
+                        rebalance_export = plan_df.to_csv(index=False)
+                        st.download_button(
+                            "📥 Download Rebalance Plan (CSV)",
+                            rebalance_export,
+                            f"rebalance_plan_{datetime.now().strftime('%Y%m%d')}.csv",
+                            "text/csv",
+                            use_container_width=True,
+                            key="rb_export_plan",
+                        )
+            else:
+                st.info("Unable to compute portfolio summary for rebalance.")
+        else:
+            st.info("Add stocks to your portfolio to use the rebalance assistant.")
+
 # ============================================================================
 # PAGE 7: STOCK ANALYSIS
 # ============================================================================
@@ -3564,28 +4811,78 @@ elif page == "Stock Analysis":
     with col2:
         if st.button("🔍 Analyze", type="primary", use_container_width=True):
             with st.spinner(f"Analyzing {symbol}..."):
-                analysis = st.session_state.stock_analyzer.analyze_stock(symbol)
-                
-                if analysis:
-                    st.session_state.current_analysis = analysis
-                    
-                    # Get news sentiment
-                    with st.spinner("Analyzing news sentiment..."):
-                        news_data = st.session_state.news_analyzer.analyze_stock_news(
-                            symbol, analysis.get('company_name', symbol)
-                        )
-                        st.session_state.current_news = news_data
-                    
-                    # Get price prediction
-                    with st.spinner("Predicting target prices..."):
-                        prediction = st.session_state.price_predictor.predict_target_price(
-                            analysis['df'],
-                            sentiment_score=news_data['sentiment_score'],
-                            fundamental_score=50  # Can be enhanced with actual fundamental data
-                        )
-                        st.session_state.current_prediction = prediction
-                else:
+                analysis, _, _ = run_detailed_stock_analysis(symbol)
+                if not analysis:
                     st.error("Failed to analyze stock")
+
+    history_entries = st.session_state.get("analysis_history", [])
+    if history_entries:
+        st.markdown("### Recent Analysis History")
+
+        preview_rows = list(reversed(history_entries[-12:]))
+        history_df = pd.DataFrame(preview_rows)
+        display_history_df = history_df.reindex(columns=[
+            "timestamp",
+            "symbol",
+            "recommendation",
+            "price",
+            "prediction_confidence",
+            "expected_return",
+            "news_sentiment",
+        ]).copy()
+        display_history_df["price"] = display_history_df["price"].map(lambda x: f"₹{float(x):.2f}")
+        display_history_df["prediction_confidence"] = display_history_df["prediction_confidence"].map(
+            lambda x: f"{float(x):.1f}%"
+        )
+        display_history_df["expected_return"] = display_history_df["expected_return"].map(
+            lambda x: f"{float(x):.2f}%"
+        )
+        display_history_df = display_history_df.rename(columns={
+            "timestamp": "Time",
+            "symbol": "Symbol",
+            "recommendation": "Call",
+            "price": "Price",
+            "prediction_confidence": "Prediction Confidence",
+            "expected_return": "Expected Return",
+            "news_sentiment": "News Sentiment",
+        })
+        st.dataframe(display_history_df, use_container_width=True, hide_index=True, height=260)
+
+        history_symbols = []
+        for row in preview_rows:
+            sym = row.get("symbol")
+            if sym and sym not in history_symbols:
+                history_symbols.append(sym)
+
+        hs_col1, hs_col2, hs_col3 = st.columns([2, 1, 1])
+        with hs_col3:
+            history_csv = pd.DataFrame(preview_rows).to_csv(index=False)
+            st.download_button(
+                "Download History",
+                history_csv,
+                f"analysis_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True,
+                key="analysis_history_export",
+            )
+
+        if history_symbols:
+            with hs_col1:
+                recent_symbol = st.selectbox(
+                    "Quick Re-Analyze",
+                    history_symbols,
+                    key="recent_symbol_reanalyze",
+                )
+            with hs_col2:
+                if st.button("Re-Analyze", use_container_width=True, key="recent_symbol_reanalyze_btn"):
+                    with st.spinner(f"Re-analyzing {recent_symbol}..."):
+                        analysis, _, _ = run_detailed_stock_analysis(recent_symbol)
+                        if not analysis:
+                            st.error("Could not run analysis for selected symbol.")
+        else:
+            st.info("History is available, but no valid symbols were found for quick re-analysis.")
+
+        st.markdown("---")
     
     if 'current_analysis' in st.session_state:
         analysis = st.session_state.current_analysis
@@ -3685,6 +4982,162 @@ elif page == "Stock Analysis":
                 st.metric("Resistance", f"₹{prediction['resistance']:.2f}")
             with col4:
                 st.metric("Pivot Point", f"₹{prediction['pivot_points']['pivot']:.2f}")
+
+            st.markdown("#### Trade Planner (Risk-Based Position Sizing)")
+            tp_col1, tp_col2, tp_col3 = st.columns(3)
+            with tp_col1:
+                plan_capital = st.number_input(
+                    "Account Capital (₹)",
+                    min_value=1000.0,
+                    value=100000.0,
+                    step=5000.0,
+                    key=f"tp_cap_{analysis['symbol']}",
+                )
+            with tp_col2:
+                plan_risk_pct = st.slider(
+                    "Risk Per Trade (%)",
+                    min_value=0.25,
+                    max_value=5.0,
+                    value=1.0,
+                    step=0.25,
+                    key=f"tp_risk_{analysis['symbol']}",
+                )
+            with tp_col3:
+                entry_basis = st.radio(
+                    "Entry Basis",
+                    ["Buy Price", "Current Price"],
+                    horizontal=True,
+                    key=f"tp_entry_{analysis['symbol']}",
+                )
+
+            entry_price = prediction['buy_price'] if entry_basis == "Buy Price" else prediction['current_price']
+            trade_plan = build_trade_plan(
+                account_capital=plan_capital,
+                risk_pct=plan_risk_pct,
+                entry_price=entry_price,
+                stop_loss=prediction['stop_loss'],
+                target_price=prediction['target_price'],
+            )
+
+            if trade_plan['valid']:
+                pc1, pc2, pc3, pc4 = st.columns(4)
+                with pc1:
+                    st.metric("Risk Budget", f"₹{trade_plan['risk_budget']:.2f}")
+                with pc2:
+                    st.metric("Position Size", f"{trade_plan['shares']} shares")
+                with pc3:
+                    st.metric("Position Value", f"₹{trade_plan['position_value']:.2f}")
+                with pc4:
+                    st.metric("Max Loss", f"₹{trade_plan['potential_loss']:.2f}")
+
+                pc5, pc6, pc7, pc8 = st.columns(4)
+                with pc5:
+                    st.metric("Potential Profit", f"₹{trade_plan['potential_profit']:.2f}")
+                with pc6:
+                    st.metric("Planned R:R", f"{trade_plan['risk_reward']:.2f}")
+                with pc7:
+                    st.metric("Capital Used", f"{trade_plan['capital_utilization_pct']:.1f}%")
+                with pc8:
+                    st.metric("Risk Used", f"{trade_plan['risk_utilization_pct']:.1f}%")
+
+                if trade_plan['capital_limited']:
+                    st.info("Position size is capital-limited before full risk budget could be deployed.")
+                if trade_plan['potential_profit'] <= 0:
+                    st.warning("Target price is not above entry; expected reward is not favorable for a long setup.")
+            else:
+                st.warning(trade_plan['error'])
+
+            st.markdown("#### Scenario Simulator (What-If)")
+            sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
+            with sc_col1:
+                scenario_entry = st.number_input(
+                    "Entry Price",
+                    min_value=0.01,
+                    value=float(prediction['buy_price']),
+                    step=1.0,
+                    key=f"scenario_entry_{analysis['symbol']}",
+                )
+            with sc_col2:
+                scenario_stop = st.number_input(
+                    "Stop Loss",
+                    min_value=0.01,
+                    value=float(prediction['stop_loss']),
+                    step=1.0,
+                    key=f"scenario_stop_{analysis['symbol']}",
+                )
+            with sc_col3:
+                scenario_target = st.number_input(
+                    "Target Price",
+                    min_value=0.01,
+                    value=float(prediction['target_price']),
+                    step=1.0,
+                    key=f"scenario_target_{analysis['symbol']}",
+                )
+            with sc_col4:
+                scenario_win_prob = st.slider(
+                    "Win Probability (%)",
+                    min_value=5,
+                    max_value=95,
+                    value=int(min(max(prediction.get('confidence', 50), 5), 95)),
+                    key=f"scenario_win_prob_{analysis['symbol']}",
+                )
+
+            scenario_capital = st.number_input(
+                "Scenario Capital (₹)",
+                min_value=1000.0,
+                value=float(plan_capital),
+                step=5000.0,
+                key=f"scenario_capital_{analysis['symbol']}",
+            )
+
+            scenario = compute_trade_scenario(
+                entry_price=float(scenario_entry),
+                stop_loss=float(scenario_stop),
+                target_price=float(scenario_target),
+                win_probability_pct=float(scenario_win_prob),
+                capital=float(scenario_capital),
+            )
+
+            if scenario['valid']:
+                sm1, sm2, sm3, sm4 = st.columns(4)
+                with sm1:
+                    st.metric("Shares", f"{scenario['shares']}")
+                with sm2:
+                    st.metric("R:R", f"{scenario['risk_reward']:.2f}")
+                with sm3:
+                    st.metric("Expected Value", f"₹{scenario['expected_value']:.2f}")
+                with sm4:
+                    st.metric("Breakeven Win %", f"{scenario['breakeven_win_rate']:.1f}%")
+
+                sm5, sm6, sm7 = st.columns(3)
+                with sm5:
+                    st.metric("Win Outcome", f"₹{scenario['pnl_if_win']:.2f}")
+                with sm6:
+                    st.metric("Loss Outcome", f"-₹{scenario['pnl_if_loss']:.2f}")
+                with sm7:
+                    st.metric("Expectancy (R)", f"{scenario['expectancy_r']:.2f}")
+
+                scenario_fig = go.Figure()
+                scenario_fig.add_trace(
+                    go.Bar(
+                        x=["Win Case", "Loss Case", "Expected"],
+                        y=[
+                            scenario['pnl_if_win'],
+                            -scenario['pnl_if_loss'],
+                            scenario['expected_value'],
+                        ],
+                        marker_color=["#2ecc71", "#e74c3c", "#3498db"],
+                    )
+                )
+                scenario_fig.update_layout(
+                    title="Scenario Payoff Profile",
+                    height=280,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    yaxis_title="PnL (₹)",
+                )
+                st.plotly_chart(scenario_fig, use_container_width=True)
+            else:
+                st.warning(scenario['error'])
             
             # Score breakdown
             st.markdown("#### Prediction Score Breakdown")
@@ -4029,6 +5482,8 @@ elif page == "Stock Analysis":
         # ============ FUNDAMENTAL ANALYSIS SECTION ============
         st.markdown("### 📋 Fundamental Analysis")
 
+        fundamental_overall_score = None
+
         try:
             fund_data = st.session_state.fundamental_analyzer.get_fundamentals(
                 analysis['symbol'].replace('.NS', ''), "NSE"
@@ -4038,6 +5493,7 @@ elif page == "Stock Analysis":
                 score_result = st.session_state.fundamental_analyzer.score_fundamentals(fund_data)
 
                 if score_result:
+                    fundamental_overall_score = float(score_result.get("overall_score", 50))
                     rating = score_result["rating"]
                     rating_color = "#2ecc71" if "Buy" in rating else ("#e74c3c" if "Sell" in rating else "#f39c12")
                     st.markdown(f"**Fundamental Rating:** <span style='color:{rating_color}; font-weight:bold; font-size:1.2em;'>"
@@ -4119,9 +5575,75 @@ elif page == "Stock Analysis":
 
         st.markdown("---")
 
+        # ============ CONFLUENCE DASHBOARD ============
+        st.markdown("### Signal Confluence Dashboard")
+        confluence = compute_analysis_confluence(
+            analysis,
+            prediction=prediction,
+            news_data=news_data,
+            fundamental_score=fundamental_overall_score,
+        )
+
+        overall_score = confluence["overall_score"]
+        if overall_score >= 75:
+            badge_color = "#2ecc71"
+        elif overall_score >= 60:
+            badge_color = "#27ae60"
+        elif overall_score >= 45:
+            badge_color = "#f39c12"
+        elif overall_score >= 30:
+            badge_color = "#e67e22"
+        else:
+            badge_color = "#e74c3c"
+
+        st.markdown(
+            f"<div style='padding:0.8rem 1rem; border-radius:10px; border:1px solid {badge_color}; "
+            f"background: rgba(255,255,255,0.02);'>"
+            f"<strong>Overall Confluence:</strong> {overall_score:.1f}/100 &nbsp; | &nbsp; "
+            f"<strong>Bias:</strong> <span style='color:{badge_color}; font-weight:700;'>{confluence['label']}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        comp = confluence["components"]
+        cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+        with cc1:
+            st.metric("Technical", f"{comp['technical']:.1f}")
+        with cc2:
+            st.metric("Prediction", f"{comp['prediction']:.1f}")
+        with cc3:
+            st.metric("Sentiment", f"{comp['sentiment']:.1f}")
+        with cc4:
+            st.metric("Fundamental", f"{comp['fundamental']:.1f}")
+        with cc5:
+            st.metric("Recommendation", f"{comp['recommendation']:.1f}")
+
+        confluence_df = pd.DataFrame(
+            [
+                {"Component": "Technical", "Score": comp["technical"]},
+                {"Component": "Prediction", "Score": comp["prediction"]},
+                {"Component": "Sentiment", "Score": comp["sentiment"]},
+                {"Component": "Fundamental", "Score": comp["fundamental"]},
+                {"Component": "Recommendation", "Score": comp["recommendation"]},
+            ]
+        )
+        fig_confluence = px.bar(
+            confluence_df,
+            x="Component",
+            y="Score",
+            color="Component",
+            text=confluence_df["Score"].map(lambda x: f"{x:.1f}"),
+            range_y=[0, 100],
+            title="Confluence Components (0-100)",
+        )
+        fig_confluence.update_layout(showlegend=False, height=320)
+        st.plotly_chart(fig_confluence, use_container_width=True)
+
+        st.markdown("---")
+
         # ============ EXPORT SECTION ============
         st.markdown("### 📥 Export Report")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
 
         with col1:
             # CSV export of key metrics
@@ -4170,6 +5692,31 @@ elif page == "Stock Analysis":
                     st.download_button("🛡️ Download Risk Metrics", risk_csv,
                                        f"{analysis['symbol']}_risk.csv", "text/csv",
                                        use_container_width=True)
+            except Exception:
+                pass
+
+        with col4:
+            # Confluence snapshot export
+            try:
+                confluence_export = {
+                    "symbol": analysis.get("symbol"),
+                    "company": analysis.get("company_name"),
+                    "timestamp": datetime.now().isoformat(),
+                    "overall_score": float(confluence.get("overall_score", 0)),
+                    "label": confluence.get("label", "N/A"),
+                    "components": {
+                        k: float(v) for k, v in confluence.get("components", {}).items()
+                    },
+                }
+                confluence_json = json.dumps(confluence_export, indent=2)
+                st.download_button(
+                    "📦 Download Confluence",
+                    confluence_json,
+                    f"{analysis['symbol']}_confluence.json",
+                    "application/json",
+                    use_container_width=True,
+                    key="confluence_export",
+                )
             except Exception:
                 pass
 
@@ -4299,6 +5846,52 @@ elif page == "Watchlist":
                 else:
                     st.warning(f"{wl_symbol} is already in your watchlist.")
 
+            st.markdown("##### Bulk Add")
+            wl_bulk_symbols = st.text_area(
+                "Paste symbols (comma/space/newline separated)",
+                height=90,
+                key="wl_bulk_symbols",
+            )
+            if st.button("➕ Add Symbols in Bulk", key="wl_add_bulk"):
+                parsed_symbols = parse_symbol_list(wl_bulk_symbols)
+                if not parsed_symbols:
+                    st.warning("Please provide at least one valid symbol.")
+                else:
+                    allowed_symbols = {normalize_ticker_symbol(s) for s in wl_stocks}
+                    existing_symbols = {
+                        normalize_ticker_symbol(item.get('symbol') if isinstance(item, dict) else item)
+                        for item in st.session_state.watchlist
+                    }
+
+                    added = []
+                    duplicates = []
+                    invalid = []
+
+                    for sym in parsed_symbols:
+                        if sym in existing_symbols:
+                            duplicates.append(sym)
+                            continue
+                        if sym not in allowed_symbols:
+                            invalid.append(sym)
+                            continue
+
+                        st.session_state.watchlist.append({'symbol': sym, 'exchange': wl_exchange})
+                        existing_symbols.add(sym)
+                        added.append(sym)
+
+                    if added and st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+                        try:
+                            save_user_watchlist(st.session_state.auth_username, st.session_state.watchlist)
+                        except Exception:
+                            pass
+
+                    if added:
+                        st.success(f"Added {len(added)} symbol(s): {', '.join(added[:8])}{'...' if len(added) > 8 else ''}")
+                    if duplicates:
+                        st.info(f"Skipped {len(duplicates)} duplicate symbol(s).")
+                    if invalid:
+                        st.warning(f"Skipped {len(invalid)} symbol(s) not in selected universe: {', '.join(invalid[:8])}{'...' if len(invalid) > 8 else ''}")
+
         with col2:
             st.markdown("#### Remove Stock")
             if st.session_state.watchlist:
@@ -4333,81 +5926,86 @@ elif page == "Watchlist":
 
 elif page == "Price Alerts":
     st.markdown("## 🔔 Price Alerts")
-    st.info("Set alerts for price thresholds. Active alerts are checked when you visit this page.")
+    st.info("Set threshold alerts with auto-checking, repeat cooldowns, expiry, and webhook/email delivery support.")
 
     tab1, tab2, tab3 = st.tabs(["Active Alerts", "Create Alert", "Alert History"])
 
     with tab1:
         st.markdown("### Active Alerts")
 
-        if st.session_state.price_alerts:
-            # Check alerts against live prices
-            checked_alerts = []
-            triggered = []
+        top_col1, top_col2 = st.columns([1, 2])
+        with top_col1:
+            if st.button("🔄 Check Alerts Now", key="alert_check_now", use_container_width=True):
+                manual_result = process_price_alerts(force=True)
+                if manual_result.get("triggered"):
+                    st.success(f"Triggered {len(manual_result['triggered'])} alert(s).")
+                if manual_result.get("expired"):
+                    st.warning(f"Expired {len(manual_result['expired'])} alert(s).")
+                if not manual_result.get("triggered") and not manual_result.get("expired"):
+                    st.info("No alert state changes found.")
+        with top_col2:
+            st.caption(
+                f"Auto-check interval: {int(st.session_state.alert_check_interval_sec)} sec | "
+                f"Repeat cooldown: {int(st.session_state.alert_repeat_cooldown_min)} min"
+            )
 
-            for alert in st.session_state.price_alerts:
+        recent_notifications = st.session_state.get("recent_alert_notifications", [])
+        if recent_notifications:
+            with st.expander("Recent Notifications"):
+                for n in reversed(recent_notifications[-10:]):
+                    channels = ", ".join(n.get("channels", []))
+                    st.write(f"{n.get('timestamp', '')[:19]} | {n.get('message', '')} | Channels: {channels}")
+
+        if st.session_state.price_alerts:
+            alert_data = []
+            for a in st.session_state.price_alerts:
                 try:
                     data = st.session_state.exchange_handler.get_stock_data(
-                        alert['symbol'], alert.get('exchange', 'NSE'), period="5d"
+                        a['symbol'], a.get('exchange', 'NSE'), period="5d"
                     )
                     if data is not None and len(data) > 0:
-                        current_price = float(data['Close'].iloc[-1])
-                        alert['current_price'] = current_price
-
-                        condition_met = False
-                        if alert['condition'] == 'above' and current_price >= alert['target_price']:
-                            condition_met = True
-                        elif alert['condition'] == 'below' and current_price <= alert['target_price']:
-                            condition_met = True
-
-                        if condition_met:
-                            triggered.append(alert)
-                            st.session_state.alert_history.append({
-                                **alert,
-                                'triggered_at': datetime.now().isoformat(),
-                                'triggered_price': current_price
-                            })
-                        else:
-                            checked_alerts.append(alert)
-                    else:
-                        checked_alerts.append(alert)
+                        a['current_price'] = float(data['Close'].iloc[-1])
                 except Exception:
-                    checked_alerts.append(alert)
+                    pass
 
-            # Show triggered
-            if triggered:
-                st.markdown("#### 🚨 Triggered Alerts!")
-                for a in triggered:
-                    st.success(f"**{a['symbol']}** ({a.get('exchange', 'NSE')}) — Price {'above' if a['condition'] == 'above' else 'below'} "
-                              f"₹{a['target_price']:.2f} → Current: ₹{a.get('current_price', 0):.2f}")
-                st.session_state.price_alerts = checked_alerts
+                target_price = float(a.get('target_price', 0) or 0)
+                current_price = float(a.get('current_price', 0) or 0)
+                distance = ((current_price / target_price) - 1) * 100 if target_price > 0 else 0
+                expires_at = safe_parse_datetime(a.get('expires_at'))
+                alert_data.append({
+                    'Symbol': a['symbol'],
+                    'Exchange': a.get('exchange', 'NSE'),
+                    'Condition': f"Price {a['condition']}",
+                    'Target': f"₹{target_price:.2f}",
+                    'Current': f"₹{current_price:.2f}",
+                    'Distance': f"{distance:+.2f}%",
+                    'Repeat': "Yes" if a.get('repeat', False) else "No",
+                    'Cooldown (min)': int(a.get('cooldown_minutes', st.session_state.alert_repeat_cooldown_min)),
+                    'Expires': expires_at.strftime('%Y-%m-%d') if expires_at else "Never",
+                    'Note': a.get('note', ''),
+                })
 
-            # Show active
-            if checked_alerts:
-                alert_data = []
-                for a in checked_alerts:
-                    distance = ((a.get('current_price', 0) / a['target_price']) - 1) * 100 if a['target_price'] > 0 else 0
-                    alert_data.append({
-                        'Symbol': a['symbol'],
-                        'Exchange': a.get('exchange', 'NSE'),
-                        'Condition': f"Price {a['condition']}",
-                        'Target': f"₹{a['target_price']:.2f}",
-                        'Current': f"₹{a.get('current_price', 0):.2f}",
-                        'Distance': f"{distance:+.2f}%",
-                        'Note': a.get('note', ''),
-                    })
-                st.dataframe(pd.DataFrame(alert_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(alert_data), use_container_width=True, hide_index=True)
 
-                # Delete alert
-                del_idx = st.selectbox("Select alert to delete", range(len(checked_alerts)),
-                                       format_func=lambda i: f"{checked_alerts[i]['symbol']} - {checked_alerts[i]['condition']} ₹{checked_alerts[i]['target_price']:.2f}",
-                                       key="alert_del_sel")
-                if st.button("🗑️ Delete Selected Alert", key="alert_del"):
-                    st.session_state.price_alerts.pop(del_idx)
-                    st.success("Alert deleted.")
-                    st.rerun()
-            else:
-                st.info("No active alerts. Create one from the 'Create Alert' tab.")
+            del_idx = st.selectbox(
+                "Select alert to delete",
+                range(len(st.session_state.price_alerts)),
+                format_func=lambda i: (
+                    f"{st.session_state.price_alerts[i]['symbol']} - "
+                    f"{st.session_state.price_alerts[i]['condition']} "
+                    f"₹{float(st.session_state.price_alerts[i]['target_price']):.2f}"
+                ),
+                key="alert_del_sel",
+            )
+            if st.button("🗑️ Delete Selected Alert", key="alert_del"):
+                st.session_state.price_alerts.pop(del_idx)
+                if st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+                    try:
+                        save_user_alerts(st.session_state.auth_username, st.session_state.price_alerts)
+                    except Exception:
+                        pass
+                st.success("Alert deleted.")
+                st.rerun()
         else:
             st.info("No active alerts. Create one from the 'Create Alert' tab.")
 
@@ -4430,6 +6028,23 @@ elif page == "Price Alerts":
                                            format_func=lambda x: f"Price goes {x}")
             alert_price = st.number_input("Target Price (₹)", min_value=0.01, value=100.0, step=1.0, key="alert_price")
             alert_note = st.text_input("Note (optional)", key="alert_note")
+            alert_repeat = st.checkbox("Repeat after trigger", value=False, key="alert_repeat")
+            alert_cooldown_min = st.number_input(
+                "Repeat Cooldown (minutes)",
+                min_value=1,
+                max_value=1440,
+                value=int(st.session_state.alert_repeat_cooldown_min),
+                step=5,
+                key="alert_cooldown_min",
+            )
+            alert_expiry_days = st.number_input(
+                "Auto-expire after (days)",
+                min_value=1,
+                max_value=365,
+                value=30,
+                step=1,
+                key="alert_expiry_days",
+            )
 
         # Show current price for reference
         try:
@@ -4441,13 +6056,17 @@ elif page == "Price Alerts":
             pass
 
         if st.button("🔔 Create Alert", type="primary", use_container_width=True, key="alert_create"):
+            created_at = datetime.now()
             new_alert = {
                 'symbol': alert_symbol,
                 'exchange': alert_exchange,
                 'condition': alert_condition,
                 'target_price': alert_price,
                 'note': alert_note,
-                'created_at': datetime.now().isoformat(),
+                'repeat': bool(alert_repeat),
+                'cooldown_minutes': int(alert_cooldown_min),
+                'created_at': created_at.isoformat(),
+                'expires_at': (created_at + timedelta(days=int(alert_expiry_days))).isoformat(),
             }
             st.session_state.price_alerts.append(new_alert)
             # Persist for logged-in users
@@ -4456,7 +6075,12 @@ elif page == "Price Alerts":
                     save_user_alerts(st.session_state.auth_username, st.session_state.price_alerts)
                 except Exception:
                     pass
-            st.success(f"Alert created: {alert_symbol} {alert_condition} ₹{alert_price:.2f}")
+            st.success(
+                f"Alert created: {alert_symbol} {alert_condition} ₹{alert_price:.2f} | "
+                f"Repeat: {'Yes' if alert_repeat else 'No'} | "
+                f"Cooldown: {int(alert_cooldown_min)} min | "
+                f"Expires in: {int(alert_expiry_days)} day(s)"
+            )
             st.rerun()
 
     with tab3:
@@ -4464,12 +6088,16 @@ elif page == "Price Alerts":
         if st.session_state.alert_history:
             hist_data = []
             for h in reversed(st.session_state.alert_history[-50:]):
+                expires_at = safe_parse_datetime(h.get('expires_at'))
                 hist_data.append({
                     'Symbol': h['symbol'],
                     'Exchange': h.get('exchange', 'NSE'),
                     'Condition': f"Price {h['condition']} ₹{h['target_price']:.2f}",
+                    'Status': h.get('status', 'triggered').title(),
+                    'Channels': h.get('notification_channels', 'N/A'),
                     'Triggered Price': f"₹{h.get('triggered_price', 0):.2f}",
                     'Triggered At': h.get('triggered_at', 'N/A'),
+                    'Expires': expires_at.strftime('%Y-%m-%d') if expires_at else 'N/A',
                     'Note': h.get('note', ''),
                 })
             st.dataframe(pd.DataFrame(hist_data), use_container_width=True, hide_index=True)
@@ -4482,7 +6110,238 @@ elif page == "Price Alerts":
 
 
 # ============================================================================
-# PAGE 10: SETTINGS
+# PAGE 10: TRADE JOURNAL
+# ============================================================================
+
+elif page == "Trade Journal":
+    st.markdown("## 📘 Trade Journal")
+    st.info("Log trades with outcome tags and attachments, then analyze your execution quality over time.")
+
+    tab1, tab2, tab3 = st.tabs(["Log Trade", "Journal Entries", "Analytics"])
+
+    with tab1:
+        st.markdown("### Add Trade Entry")
+
+        default_symbol = st.session_state.get("current_analysis", {}).get("symbol") if isinstance(st.session_state.get("current_analysis"), dict) else None
+        symbol_index = st.session_state.nse_stocks.index(default_symbol) if default_symbol in st.session_state.nse_stocks else 0
+
+        with st.form("journal_add_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                j_symbol = st.selectbox("Symbol", st.session_state.nse_stocks, index=symbol_index, key="j_symbol")
+                j_side = st.selectbox("Side", ["Long", "Short"], key="j_side")
+                j_outcome = st.selectbox("Outcome", ["Open", "Win", "Loss", "Breakeven"], key="j_outcome")
+
+            with c2:
+                j_entry_date = st.date_input("Entry Date", value=datetime.now().date(), key="j_entry_date")
+                j_exit_date = st.date_input("Exit Date", value=datetime.now().date(), key="j_exit_date")
+                j_quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="j_quantity")
+
+            with c3:
+                j_entry_price = st.number_input("Entry Price (₹)", min_value=0.01, value=100.0, step=0.5, key="j_entry_price")
+                j_exit_price = st.number_input("Exit Price (₹)", min_value=0.01, value=100.0, step=0.5, key="j_exit_price")
+                j_strategy = st.text_input("Strategy", value="", placeholder="e.g., Breakout, Mean Reversion", key="j_strategy")
+
+            j_tags = st.multiselect(
+                "Outcome Tags",
+                ["Breakout", "Pullback", "Reversal", "News", "Swing", "Intraday", "FOMO", "Disciplined", "Late Entry", "Good Risk Control"],
+                key="j_tags",
+            )
+            j_custom_tags = st.text_input("Custom Tags (comma separated)", key="j_custom_tags")
+            j_notes = st.text_area("Notes", height=110, key="j_notes")
+            j_attachment = st.file_uploader("Attach chart screenshot (optional)", type=["png", "jpg", "jpeg", "webp"], key="j_attachment")
+
+            add_trade_submit = st.form_submit_button("➕ Save Trade", type="primary", use_container_width=True)
+
+            if add_trade_submit:
+                if j_exit_date < j_entry_date:
+                    st.error("Exit date cannot be earlier than entry date.")
+                else:
+                    entry_val = float(j_entry_price) * int(j_quantity)
+                    if j_outcome == "Open":
+                        pnl = 0.0
+                        pnl_pct = 0.0
+                    else:
+                        if j_side == "Long":
+                            pnl = (float(j_exit_price) - float(j_entry_price)) * int(j_quantity)
+                        else:
+                            pnl = (float(j_entry_price) - float(j_exit_price)) * int(j_quantity)
+                        pnl_pct = (pnl / entry_val) * 100 if entry_val > 0 else 0.0
+
+                    custom_tags = [t.strip() for t in str(j_custom_tags).split(",") if t.strip()]
+                    all_tags = list(dict.fromkeys(list(j_tags) + custom_tags))
+                    attachment_name = save_journal_attachment(j_attachment) if j_attachment is not None else ""
+
+                    new_trade = {
+                        "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
+                        "symbol": j_symbol,
+                        "side": j_side,
+                        "entry_date": str(j_entry_date),
+                        "exit_date": str(j_exit_date),
+                        "quantity": int(j_quantity),
+                        "entry_price": float(j_entry_price),
+                        "exit_price": float(j_exit_price),
+                        "strategy": j_strategy.strip(),
+                        "outcome": j_outcome,
+                        "tags": all_tags,
+                        "notes": j_notes.strip(),
+                        "attachment": attachment_name,
+                        "pnl": float(round(pnl, 2)),
+                        "pnl_pct": float(round(pnl_pct, 2)),
+                        "created_at": datetime.now().isoformat(),
+                    }
+
+                    st.session_state.trade_journal.append(new_trade)
+                    if st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+                        try:
+                            save_user_trade_journal(st.session_state.auth_username, st.session_state.trade_journal)
+                        except Exception:
+                            pass
+
+                    st.success(f"Trade saved for {j_symbol}. P&L: ₹{pnl:.2f} ({pnl_pct:.2f}%).")
+                    st.rerun()
+
+    with tab2:
+        st.markdown("### Journal Entries")
+        entries = st.session_state.get("trade_journal", [])
+
+        if entries:
+            journal_df = pd.DataFrame(entries)
+            if "tags" in journal_df.columns:
+                journal_df["tags"] = journal_df["tags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x or ""))
+
+            filt_col1, filt_col2 = st.columns(2)
+            with filt_col1:
+                outcome_filter = st.multiselect(
+                    "Filter by Outcome",
+                    options=["Open", "Win", "Loss", "Breakeven"],
+                    default=["Open", "Win", "Loss", "Breakeven"],
+                    key="journal_outcome_filter",
+                )
+            with filt_col2:
+                strategy_query = st.text_input("Filter by Strategy", key="journal_strategy_filter")
+
+            filtered_df = journal_df[journal_df["outcome"].isin(outcome_filter)] if outcome_filter else journal_df.copy()
+            if strategy_query.strip() and "strategy" in filtered_df.columns:
+                filtered_df = filtered_df[
+                    filtered_df["strategy"].astype(str).str.contains(strategy_query.strip(), case=False, na=False)
+                ]
+
+            display_cols = [
+                "symbol", "side", "entry_date", "exit_date", "quantity", "entry_price", "exit_price",
+                "outcome", "strategy", "tags", "pnl", "pnl_pct", "attachment"
+            ]
+            display_cols = [c for c in display_cols if c in filtered_df.columns]
+            st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True)
+
+            del_col1, del_col2 = st.columns([3, 1])
+            with del_col1:
+                selected_trade_id = st.selectbox(
+                    "Select Entry",
+                    options=[e["id"] for e in entries],
+                    format_func=lambda tid: next(
+                        (
+                            f"{e['entry_date']} | {e['symbol']} | {e['outcome']} | ₹{e.get('pnl', 0):.2f}"
+                            for e in entries if e["id"] == tid
+                        ),
+                        tid,
+                    ),
+                    key="journal_delete_select",
+                )
+            with del_col2:
+                st.markdown("<div style='height: 1.8rem;'></div>", unsafe_allow_html=True)
+                if st.button("🗑️ Delete Entry", key="journal_delete_btn", use_container_width=True):
+                    st.session_state.trade_journal = [e for e in entries if e.get("id") != selected_trade_id]
+                    if st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+                        try:
+                            save_user_trade_journal(st.session_state.auth_username, st.session_state.trade_journal)
+                        except Exception:
+                            pass
+                    st.success("Trade entry deleted.")
+                    st.rerun()
+
+            selected_entry = next((e for e in entries if e.get("id") == selected_trade_id), None)
+            attachment_name = selected_entry.get("attachment") if isinstance(selected_entry, dict) else ""
+            if attachment_name:
+                attachment_path = Path(__file__).parent / ".journal_attachments" / attachment_name
+                if attachment_path.exists():
+                    st.markdown("#### Attached Screenshot")
+                    st.image(str(attachment_path), use_container_width=True)
+
+            st.download_button(
+                "📥 Download Journal (CSV)",
+                filtered_df.to_csv(index=False),
+                f"trade_journal_{datetime.now().strftime('%Y%m%d')}.csv",
+                "text/csv",
+                use_container_width=True,
+                key="journal_export_csv",
+            )
+        else:
+            st.info("No journal entries yet. Log your first trade in the first tab.")
+
+    with tab3:
+        st.markdown("### Journal Analytics")
+        entries = st.session_state.get("trade_journal", [])
+
+        if entries:
+            analytics_df = pd.DataFrame(entries)
+            closed_df = analytics_df[analytics_df["outcome"] != "Open"].copy() if "outcome" in analytics_df.columns else pd.DataFrame()
+
+            if not closed_df.empty:
+                closed_df["pnl"] = pd.to_numeric(closed_df["pnl"], errors="coerce").fillna(0.0)
+                closed_df["pnl_pct"] = pd.to_numeric(closed_df["pnl_pct"], errors="coerce").fillna(0.0)
+                total_closed = len(closed_df)
+                wins_df = closed_df[closed_df["pnl"] > 0]
+                losses_df = closed_df[closed_df["pnl"] < 0]
+
+                win_rate = (len(wins_df) / total_closed) * 100 if total_closed > 0 else 0
+                avg_win = wins_df["pnl"].mean() if len(wins_df) > 0 else 0.0
+                avg_loss = losses_df["pnl"].mean() if len(losses_df) > 0 else 0.0
+                expectancy = (win_rate / 100) * avg_win + (1 - win_rate / 100) * avg_loss
+
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    st.metric("Closed Trades", total_closed)
+                with m2:
+                    st.metric("Win Rate", f"{win_rate:.2f}%")
+                with m3:
+                    st.metric("Net P&L", f"₹{closed_df['pnl'].sum():.2f}")
+                with m4:
+                    st.metric("Expectancy", f"₹{expectancy:.2f} / trade")
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("Average Win", f"₹{avg_win:.2f}")
+                with c2:
+                    st.metric("Average Loss", f"₹{avg_loss:.2f}")
+
+                closed_df["exit_date"] = pd.to_datetime(closed_df["exit_date"], errors="coerce")
+                closed_df = closed_df.sort_values("exit_date")
+                closed_df["cumulative_pnl"] = closed_df["pnl"].cumsum()
+
+                fig_pnl = go.Figure()
+                fig_pnl.add_trace(go.Scatter(
+                    x=closed_df["exit_date"],
+                    y=closed_df["cumulative_pnl"],
+                    mode="lines+markers",
+                    name="Cumulative P&L",
+                    line=dict(color="#667eea", width=2),
+                ))
+                fig_pnl.update_layout(title="Cumulative P&L Curve", height=320, yaxis_title="₹")
+                st.plotly_chart(fig_pnl, use_container_width=True)
+
+                outcome_counts = closed_df["outcome"].value_counts().reset_index()
+                outcome_counts.columns = ["Outcome", "Count"]
+                fig_outcome = px.pie(outcome_counts, names="Outcome", values="Count", title="Outcome Distribution")
+                st.plotly_chart(fig_outcome, use_container_width=True)
+            else:
+                st.info("No closed trades yet. Close at least one trade for analytics.")
+        else:
+            st.info("No journal entries yet.")
+
+
+# ============================================================================
+# PAGE 11: SETTINGS
 # ============================================================================
 
 elif page == "Settings":
@@ -4534,14 +6393,55 @@ elif page == "Settings":
                                           st.session_state.risk_analytics.risk_free_rate * 100, 0.5,
                                           key="pref_rfr")
 
+        st.markdown("#### Alert Delivery")
+        pref_alert_webhook = st.text_input(
+            "Webhook URL (optional)",
+            value=st.session_state.alert_webhook_url,
+            placeholder="https://example.com/alerts",
+            key="pref_alert_webhook",
+        )
+        pref_email_alerts = st.checkbox(
+            "Enable Email Alerts (requires SMTP environment variables)",
+            value=st.session_state.enable_email_alerts,
+            key="pref_email_alerts",
+        )
+
+        c_pref1, c_pref2 = st.columns(2)
+        with c_pref1:
+            pref_alert_interval = st.slider(
+                "Auto-check Interval (seconds)",
+                min_value=15,
+                max_value=300,
+                value=int(st.session_state.alert_check_interval_sec),
+                step=15,
+                key="pref_alert_interval",
+            )
+        with c_pref2:
+            pref_repeat_cooldown = st.number_input(
+                "Default Repeat Cooldown (minutes)",
+                min_value=1,
+                max_value=1440,
+                value=int(st.session_state.alert_repeat_cooldown_min),
+                step=5,
+                key="pref_repeat_cooldown",
+            )
+
         if st.button("💾 Save Preferences", type="primary", use_container_width=True, key="pref_save"):
             st.session_state.current_exchange = pref_exchange
             st.session_state.risk_analytics.risk_free_rate = pref_risk_free / 100
             st.session_state.portfolio_risk.risk_analytics.risk_free_rate = pref_risk_free / 100
+            st.session_state.alert_webhook_url = pref_alert_webhook.strip()
+            st.session_state.enable_email_alerts = bool(pref_email_alerts)
+            st.session_state.alert_check_interval_sec = int(pref_alert_interval)
+            st.session_state.alert_repeat_cooldown_min = int(pref_repeat_cooldown)
             if st.session_state.auth_username and st.session_state.auth_username != "__guest__":
                 save_user_settings(st.session_state.auth_username, {
                     "default_exchange": pref_exchange,
                     "risk_free_rate": pref_risk_free,
+                    "alert_webhook_url": st.session_state.alert_webhook_url,
+                    "enable_email_alerts": st.session_state.enable_email_alerts,
+                    "alert_check_interval_sec": st.session_state.alert_check_interval_sec,
+                    "alert_repeat_cooldown_min": st.session_state.alert_repeat_cooldown_min,
                 })
             st.success("Preferences saved!")
 
@@ -4554,8 +6454,10 @@ elif page == "Settings":
             try:
                 all_data = {
                     "watchlist": st.session_state.get('watchlist', []),
+                    "portfolio": st.session_state.portfolio_manager.portfolio,
                     "alerts": st.session_state.get('price_alerts', []),
                     "alert_history": st.session_state.get('alert_history', []),
+                    "trade_journal": st.session_state.get('trade_journal', []),
                 }
                 export_json = json.dumps(all_data, indent=2, default=str)
                 st.download_button("📥 Export Data (JSON)", export_json,
@@ -4573,10 +6475,37 @@ elif page == "Settings":
                     if st.button("📤 Import Data", type="primary", use_container_width=True, key="import_data_btn"):
                         if "watchlist" in imported:
                             st.session_state.watchlist = imported["watchlist"]
+                        if "portfolio" in imported and isinstance(imported["portfolio"], list):
+                            st.session_state.portfolio_manager.portfolio = imported["portfolio"]
                         if "alerts" in imported:
                             st.session_state.price_alerts = imported["alerts"]
                         if "alert_history" in imported:
                             st.session_state.alert_history = imported["alert_history"]
+                        if "trade_journal" in imported and isinstance(imported["trade_journal"], list):
+                            st.session_state.trade_journal = imported["trade_journal"]
+
+                        if st.session_state.auth_username and st.session_state.auth_username != "__guest__":
+                            try:
+                                save_user_watchlist(st.session_state.auth_username, st.session_state.watchlist)
+                            except Exception:
+                                pass
+                            try:
+                                save_user_portfolio(st.session_state.auth_username,
+                                                    st.session_state.portfolio_manager.portfolio)
+                            except Exception:
+                                pass
+                            try:
+                                save_user_alerts(st.session_state.auth_username, st.session_state.price_alerts)
+                            except Exception:
+                                pass
+                            try:
+                                save_user_trade_journal(
+                                    st.session_state.auth_username,
+                                    st.session_state.trade_journal,
+                                )
+                            except Exception:
+                                pass
+
                         st.success("Data imported successfully!")
                         st.rerun()
                 except Exception as e:
@@ -4585,8 +6514,12 @@ elif page == "Settings":
         st.markdown("---")
         st.markdown("#### Clear Cache")
         if st.button("🗑️ Clear All Cached Data", key="clear_cache"):
-            st.session_state.exchange_handler._cache.clear()
-            st.success("Cache cleared!")
+            try:
+                st.session_state.exchange_handler.clear_cache()
+            except Exception:
+                st.session_state.exchange_handler._cache.clear()
+            st.cache_data.clear()
+            st.success("Cache cleared! Realtime data will be fetched on the next action.")
 
         st.markdown("#### Reset Application")
         if st.button("⚠️ Reset All Session Data", key="reset_all"):
