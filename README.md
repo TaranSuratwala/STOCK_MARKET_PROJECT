@@ -1,3 +1,13 @@
+<p align="center">
+	<img src="https://capsule-render.vercel.app/api?type=rect&color=0:b45309,100:0f766e&height=120&section=header&text=Stock%20Market%20Project&fontSize=34&fontColor=F8FAFC&fontAlignY=60" alt="Stock Market Project banner" />
+</p>
+
+<p align="center">
+	<img src="https://img.shields.io/github/last-commit/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Last commit" />
+	<img src="https://img.shields.io/github/languages/top/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Top language" />
+	<img src="https://img.shields.io/github/repo-size/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Repo size" />
+</p>
+
 # Stock Market Project
 
 Collection of stock screening and analysis prototypes for NSE equities. Includes research scripts, rating utilities, and sample HTML reports.
@@ -7,6 +17,10 @@ Collection of stock screening and analysis prototypes for NSE equities. Includes
 - Technical and fundamental scoring helpers
 - HTML report generator for screening results
 - Sample outputs and ticker lists for NSE and Nifty 500
+
+## Site Theme
+
+A GitHub Pages ready theme lives in `docs/`. Enable Pages to serve from the `/docs` folder.
 
 ## Repository Contents
 

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang='en'>
+<head>
+  <meta charset='UTF-8' />
+  <meta name='viewport' content='width=device-width, initial-scale=1' />
+  <title>Stock Market Project</title>
+  <link rel='preconnect' href='https://fonts.googleapis.com' />
+  <link rel='preconnect' href='https://fonts.gstatic.com' crossorigin />
+  <link href='https://fonts.googleapis.com/css2?family=Spectral:wght@500;600;700&family=Rubik:wght@300;400;500;600&display=swap' rel='stylesheet' />
+  <link rel='stylesheet' href='styles.css' />
+</head>
+<body>
+  <div class='bg'>
+    <span class='ring ring-one'></span>
+    <span class='ring ring-two'></span>
+    <span class='grid'></span>
+  </div>
+
+  <header class='topbar'>
+    <div class='logo'>Stock Market Project</div>
+    <nav class='nav'>
+      <a href='#toolkit'>Toolkit</a>
+      <a href='#scripts'>Scripts</a>
+      <a href='#quickstart'>Quickstart</a>
+      <a href='#outputs'>Outputs</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class='hero'>
+      <div class='hero-copy'>
+        <p class='eyebrow'>Research workspace</p>
+        <h1>Prototype, score, and report equity signals.</h1>
+        <p class='lead'>
+          A collection of screening prototypes, rating helpers, and report templates for NSE equities.
+          Built to explore ideas quickly before productionizing them.
+        </p>
+        <div class='cta-row'>
+          <a class='btn primary' href='#quickstart'>Install dependencies</a>
+          <a class='btn ghost' href='https://github.com/TaranSuratwala/STOCK_MARKET_PROJECT'>View repo</a>
+        </div>
+      </div>
+      <div class='hero-panel'>
+        <div class='panel-card'>
+          <p class='panel-label'>Ratings</p>
+          <p class='panel-value'>Technical + fundamental</p>
+          <p class='panel-note'>Weighted scoring logic in stock_ratings.py.</p>
+        </div>
+        <div class='panel-card highlight'>
+          <p class='panel-label'>Reports</p>
+          <p class='panel-value'>HTML summaries</p>
+          <p class='panel-note'>Readable outputs for screened lists.</p>
+        </div>
+        <div class='panel-card'>
+          <p class='panel-label'>Data</p>
+          <p class='panel-value'>Nifty 500 lists</p>
+          <p class='panel-note'>CSV tickers and sample reports.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id='toolkit' class='section'>
+      <div class='section-head'>
+        <h2>Toolkit highlights</h2>
+        <p>Core building blocks for experimentation.</p>
+      </div>
+      <div class='card-grid'>
+        <article class='card'>
+          <h3>Rating engine</h3>
+          <p>Calculate momentum, volume, and trend scores for each stock.</p>
+        </article>
+        <article class='card'>
+          <h3>Report generator</h3>
+          <p>Build HTML summaries for analysts and stakeholders.</p>
+        </article>
+        <article class='card'>
+          <h3>Prototype scripts</h3>
+          <p>Explore ML, indicators, and screening logic quickly.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id='scripts' class='section'>
+      <div class='section-head'>
+        <h2>Key scripts</h2>
+        <p>Start with these files when browsing the repo.</p>
+      </div>
+      <div class='link-grid'>
+        <div class='link-card'>STOCK_SCREENER_AND_ANALYSER.py</div>
+        <div class='link-card'>prototype.py</div>
+        <div class='link-card'>report_generator.py</div>
+        <div class='link-card'>stock_ratings.py</div>
+      </div>
+    </section>
+
+    <section id='quickstart' class='section split'>
+      <div>
+        <h2>Quickstart</h2>
+        <p>Install the base dependencies for report generation and scoring.</p>
+      </div>
+      <div class='code-stack'>
+        <div class='code-card'>
+          <div class='code-title'>Python</div>
+          <pre><code>pip install pandas plotly
+pip install yfinance numpy ta scikit-learn</code></pre>
+        </div>
+        <div class='code-card'>
+          <div class='code-title'>Run reports</div>
+          <pre><code>python report_generator.py</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id='outputs' class='section'>
+      <div class='section-head'>
+        <h2>Outputs</h2>
+        <p>Sample HTML reports and ticker lists are stored in the repository root.</p>
+      </div>
+      <div class='card-grid'>
+        <article class='card'>
+          <h3>HTML screening reports</h3>
+          <p>stock_screening_report_*.html files show grouped ratings.</p>
+        </article>
+        <article class='card'>
+          <h3>CSV ticker lists</h3>
+          <p>Use Nifty 500 lists and ticker files as inputs.</p>
+        </article>
+        <article class='card'>
+          <h3>Strategy presets</h3>
+          <p>Store JSON definitions like Strategy1.json.</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class='footer'>
+    <p>Designed for rapid exploration before moving to production pipelines.</p>
+  </footer>
+</body>
+</html>
