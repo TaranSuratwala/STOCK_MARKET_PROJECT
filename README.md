@@ -1,46 +1,53 @@
 <p align="center">
-	<img src="https://capsule-render.vercel.app/api?type=rect&color=0:b45309,100:0f766e&height=120&section=header&text=Stock%20Market%20Project&fontSize=34&fontColor=F8FAFC&fontAlignY=60" alt="Stock Market Project banner" />
+  <img src="https://capsule-render.vercel.app/api?type=rect&color=0:b45309,100:0f766e&height=120&section=header&text=Stock%20Market%20Project&fontSize=34&fontColor=F8FAFC&fontAlignY=60" alt="Stock Market Project banner" />
 </p>
 
 <p align="center">
-	<img src="https://img.shields.io/github/last-commit/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Last commit" />
-	<img src="https://img.shields.io/github/languages/top/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Top language" />
-	<img src="https://img.shields.io/github/repo-size/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Repo size" />
+  <img src="https://img.shields.io/github/last-commit/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Last commit" />
+  <img src="https://img.shields.io/github/languages/top/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Top language" />
+  <img src="https://img.shields.io/github/repo-size/TaranSuratwala/STOCK_MARKET_PROJECT?style=flat-square" alt="Repo size" />
 </p>
 
 # Stock Market Project
 
-Collection of stock screening and analysis prototypes for NSE equities. Includes research scripts, rating utilities, and sample HTML reports.
+A Python-based repository for experimenting with stock screening and analysis workflows focused on NSE equities.
 
-## Highlights
+## Overview
+
+This project brings together reusable scoring utilities, report-generation logic, and research prototypes used to evaluate stocks and present screening outcomes in HTML format.
+
+## Key Capabilities
 
 - Technical and fundamental scoring helpers
-- HTML report generator for screening results
-- Sample outputs and ticker lists for NSE and Nifty 500
+- Stock rating and categorization logic
+- Automated HTML summary report generation
+- Included sample ticker datasets and generated reports
 
-## Site Theme
+## Repository Structure
 
-A GitHub Pages ready theme lives in `docs/`. Enable Pages to serve from the `/docs` folder.
+| Path | Description |
+| --- | --- |
+| `stock_ratings.py` | Rating and categorization utilities |
+| `report_generator.py` | HTML report creation functions |
+| `STOCK_SCREENER_AND_ANALYSER.py` | Prototype screener script (currently commented) |
+| `prototype.py` | Experimental analysis routines (currently commented) |
+| `Ticker_List_NSE_India.csv`, `ind_nifty500list.csv` | Input ticker universes |
+| `stock_screening_report_*.html` | Example generated outputs |
+| `docs/` | GitHub Pages-friendly documentation assets |
 
-## Repository Contents
+## Requirements
 
-- `STOCK_SCREENER_AND_ANALYSER.py` (prototype script, currently commented)
-- `prototype.py` (experimental analysis routines, commented)
-- `report_generator.py` (HTML report builder)
-- `stock_ratings.py` (rating and categorization logic)
-- CSV ticker lists and `stock_screening_report_*.html` outputs
+- Python 3.9 or later
 
-## Setup
-
-Python 3.9+ recommended.
-
-Base dependencies:
+### Base Dependencies
 
 ```bash
 pip install pandas plotly
 ```
 
-Optional dependencies for the prototype scripts:
+### Optional Prototype Dependencies
+
+Install these only if you plan to run prototype experimentation scripts:
 
 ```bash
 pip install yfinance numpy ta scikit-learn tensorflow selenium webdriver-manager textblob
@@ -48,7 +55,7 @@ pip install yfinance numpy ta scikit-learn tensorflow selenium webdriver-manager
 
 ## Usage
 
-Example: generate a summary report from results data.
+Example: generate a summary report from tabular screening results.
 
 ```python
 import pandas as pd
@@ -58,8 +65,14 @@ results = pd.read_csv("your_results.csv")
 create_summary_report(results)
 ```
 
-The report expects columns such as `Symbol`, `Market Cap`, `Category`, `Technical Score`, `Momentum`, `Volume`, `Trend`, and `Overall Rating`.
+Expected columns include:
+`Symbol`, `Market Cap`, `Category`, `Technical Score`, `Momentum`, `Volume`, `Trend`, and `Overall Rating`.
 
 ## Notes
 
-- The larger prototype scripts are commented out. Uncomment sections and install optional dependencies before running them.
+- Some larger prototype scripts are intentionally commented out.
+- Uncomment relevant sections and install optional dependencies before running those scripts.
+
+## Disclaimer
+
+This repository is intended for educational and research purposes only and should not be treated as financial advice.
